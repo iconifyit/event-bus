@@ -1,0 +1,186 @@
+/**
+ * @module event-bus/EventBus
+ * @description Core EventBus class with adapter-based pub/sub,
+ * per-handler error notification, and injectable notifiers.
+ *
+ * The EventBus wraps every handler in a safe-run envelope that catches
+ * errors and dispatches them to configured notifiers. Notifiers are
+ * injected at construction time — the package ships no concrete notifiers.
+ *
+ * @example
+ * const EventBus = require('./EventBus');
+ * const bus = new EventBus({
+ *     adapter   : new MemoryAdapter(),
+ *     notifiers : {
+ *         slack : mySlackNotifier,
+ *         email : myEmailNotifier,
+ *     },
+ * });
+ *
+ * bus.on('user.signup', handler, { onError: { notify: ['slack'] } });
+ * bus.emit('user.signup', { userId: 42 });
+ */
+const Event = require('./Event');
+
+class EventBus {
+
+    /**
+     * Create an EventBus instance.
+     *
+     * @param {Object} options
+     * @param {import('./adapters/BaseEventBusAdapter')} options.adapter - The pub/sub adapter.
+     * @param {Object<string, import('./notifiers/BaseNotifier')>} [options.notifiers={}]
+     *   Named notifier instances. Keys are used in handler config
+     *   (e.g. `{ onError: { notify: ['slack'] } }`).
+     */
+    constructor({ adapter, notifiers = {} } = {}) {
+        if (!adapter) {
+            throw new Error('EventBus requires an adapter');
+        }
+        this.adapter         = adapter;
+        this.notifiers       = notifiers;
+        this.handlerConfigs  = new WeakMap();
+        this.wrappedHandlers = new WeakMap();
+    }
+
+    /**
+     * Replace the adapter at runtime (e.g. swap Memory for Redis).
+     *
+     * @param {import('./adapters/BaseEventBusAdapter')} nextAdapter
+     */
+    setAdapter(nextAdapter) {
+        if (!nextAdapter || typeof nextAdapter.on !== 'function') {
+            throw new Error('EventBus.setAdapter requires a valid adapter instance');
+        }
+        this.adapter = nextAdapter;
+    }
+
+    /**
+     * Register a persistent listener for an event.
+     *
+     * @param {string} event - The event name (use EventTypes constants).
+     * @param {Function} handler - Async handler receiving an Event instance.
+     * @param {Object} [config={}] - Handler configuration.
+     * @param {Object} [config.onError] - Error handling config.
+     * @param {string[]} [config.onError.notify] - Notifier names to invoke on error.
+     *
+     * @example
+     * bus.on(EventTypes.USER_SIGNUP, async (event) => {
+     *     await sendWelcomeEmail(event.getData().email);
+     * }, { onError: { notify: ['slack', 'email'] } });
+     */
+    on(event, handler, config = {}) {
+        if (!event || !handler) return;
+
+        const wrapped = async (payload) => {
+            await this.safeRun(event, handler, payload);
+        };
+
+        this.handlerConfigs.set(handler, config);
+        this.wrappedHandlers.set(handler, wrapped);
+        this.adapter.on(event, wrapped);
+    }
+
+    /**
+     * Remove a previously registered listener.
+     *
+     * @param {string} event - The event name.
+     * @param {Function} handler - The original handler function passed to `on()`.
+     */
+    off(event, handler) {
+        if (!event || !handler) return;
+
+        const wrapped = this.wrappedHandlers.get(handler);
+        if (!wrapped) return;
+
+        this.adapter.off(event, wrapped);
+        this.handlerConfigs.delete(handler);
+        this.wrappedHandlers.delete(handler);
+    }
+
+    /**
+     * Register a one-time listener. The handler is automatically removed
+     * after its first invocation.
+     *
+     * @param {string} event - The event name.
+     * @param {Function} handler - Async handler receiving an Event instance.
+     * @param {Object} [config={}] - Handler configuration (same shape as `on()`).
+     */
+    once(event, handler, config = {}) {
+        if (!event || !handler) return;
+
+        const wrapped = async (payload) => {
+            await this.safeRun(event, handler, payload);
+        };
+
+        this.handlerConfigs.set(handler, config);
+        this.wrappedHandlers.set(handler, wrapped);
+        this.adapter.once(event, wrapped);
+    }
+
+    /**
+     * Emit an event. The payload is wrapped in an immutable Event object
+     * before being dispatched to listeners.
+     *
+     * @param {string} event - The event name.
+     * @param {Object} [payload={}] - The event data.
+     * @returns {boolean} `true` if the event was emitted, `false` if no event name was provided.
+     *
+     * @example
+     * bus.emit(EventTypes.ORDER_CONFIRMATION, {
+     *     orderId : 'order-123',
+     *     userId  : 42,
+     *     total   : 19.99,
+     * });
+     */
+    emit(event, payload) {
+        if (!event) return false;
+        this.adapter.emit(event, Event.create(event, payload));
+        return true;
+    }
+
+    /**
+     * Remove all listeners and reset internal state.
+     */
+    clear() {
+        this.adapter.clear();
+        this.handlerConfigs  = new WeakMap();
+        this.wrappedHandlers = new WeakMap();
+    }
+
+    /**
+     * Execute a handler inside a try/catch envelope. On error, dispatches
+     * to the notifiers specified in the handler's config.
+     *
+     * @param {string} eventName - The event name (for error messages).
+     * @param {Function} handler - The original handler function.
+     * @param {*} payload - The Event payload passed to the handler.
+     * @private
+     */
+    async safeRun(eventName, handler, payload) {
+        try {
+            await handler(payload);
+        }
+        catch (error) {
+            console.error(`[EventBus] Error in handler for "${eventName}":`, error);
+
+            const config         = this.handlerConfigs.get(handler) || {};
+            const notifierNames  = config?.onError?.notify || [];
+            const subject        = `Error in EventBus handler for "${eventName}"`;
+            const tasks          = [];
+
+            for (const name of notifierNames) {
+                const notifier = this.notifiers[name];
+                if (notifier && typeof notifier.notify === 'function') {
+                    tasks.push(notifier.notify(subject, error));
+                }
+            }
+
+            if (tasks.length > 0) {
+                await Promise.allSettled(tasks);
+            }
+        }
+    }
+}
+
+module.exports = EventBus;
