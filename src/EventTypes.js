@@ -81,12 +81,33 @@ const getEventTypes = () => {
  * EventTypes.USER_SIGNUP // => 'user.signup'
  * EventTypes.UNKNOWN     // => undefined
  */
+/**
+ * Throws a read-only error for any mutation attempt on EventTypes.
+ * @throws {Error} Always throws.
+ * @private
+ */
+const throwReadOnlyError = () => {
+    throw new Error('EventTypes is read-only. Use registerEventType() to add event types.');
+};
+
 const EventTypes = new Proxy(registry, {
     get(target, prop) {
         return target[prop];
     },
     set() {
-        throw new Error('EventTypes is read-only. Use registerEventType() to add event types.');
+        throwReadOnlyError();
+    },
+    deleteProperty() {
+        throwReadOnlyError();
+    },
+    defineProperty() {
+        throwReadOnlyError();
+    },
+    setPrototypeOf() {
+        throwReadOnlyError();
+    },
+    preventExtensions() {
+        throwReadOnlyError();
     },
 });
 

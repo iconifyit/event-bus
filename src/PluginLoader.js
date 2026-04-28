@@ -123,6 +123,10 @@ class PluginLoader {
         }
         else {
             plugin.events.forEach((eventDef, index) => {
+                if (!eventDef || typeof eventDef !== 'object') {
+                    errors.push(`events[${index}] must be a non-null object`);
+                    return;
+                }
                 if (!eventDef.type || typeof eventDef.type !== 'string') {
                     errors.push(`events[${index}] must have a non-empty string "type"`);
                 }

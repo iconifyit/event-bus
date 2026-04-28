@@ -39,14 +39,37 @@ class EventBus {
         }
         this.adapter         = adapter;
         this.notifiers       = notifiers;
-        this.handlerConfigs  = new WeakMap();
+
+        /**
+         * Maps each original handler → Map<eventName, config>.
+         * Scoped by event so the same handler can be registered
+         * for multiple events without overwriting configs.
+         * @type {WeakMap<Function, Map<string, Object>>}
+         * @private
+         */
+        this.handlerConfigs = new WeakMap();
+
+        /**
+         * Maps each original handler → Map<eventName, wrappedFn>.
+         * Scoped by event so off() removes the correct wrapper.
+         * @type {WeakMap<Function, Map<string, Function>>}
+         * @private
+         */
         this.wrappedHandlers = new WeakMap();
     }
 
     /**
      * Replace the adapter at runtime (e.g. swap Memory for Redis).
      *
+     * **Important:** This does NOT migrate existing listeners. Call this
+     * before registering any handlers, or call `clear()` first and
+     * re-register handlers after swapping.
+     *
      * @param {import('./adapters/BaseEventBusAdapter')} nextAdapter
+     *
+     * @todo Add optional listener migration — replay existing registrations
+     *   onto the new adapter and remove them from the old one, so handlers
+     *   survive a hot-swap without manual re-registration.
      */
     setAdapter(nextAdapter) {
         if (!nextAdapter || typeof nextAdapter.on !== 'function') {
@@ -76,8 +99,15 @@ class EventBus {
             await this.safeRun(event, handler, payload);
         };
 
-        this.handlerConfigs.set(handler, config);
-        this.wrappedHandlers.set(handler, wrapped);
+        if (!this.handlerConfigs.has(handler)) {
+            this.handlerConfigs.set(handler, new Map());
+        }
+        if (!this.wrappedHandlers.has(handler)) {
+            this.wrappedHandlers.set(handler, new Map());
+        }
+
+        this.handlerConfigs.get(handler).set(event, config);
+        this.wrappedHandlers.get(handler).set(event, wrapped);
         this.adapter.on(event, wrapped);
     }
 
@@ -90,12 +120,23 @@ class EventBus {
     off(event, handler) {
         if (!event || !handler) return;
 
-        const wrapped = this.wrappedHandlers.get(handler);
+        const wrappedMap = this.wrappedHandlers.get(handler);
+        if (!wrappedMap) return;
+
+        const wrapped = wrappedMap.get(event);
         if (!wrapped) return;
 
         this.adapter.off(event, wrapped);
-        this.handlerConfigs.delete(handler);
-        this.wrappedHandlers.delete(handler);
+        wrappedMap.delete(event);
+
+        const configMap = this.handlerConfigs.get(handler);
+        if (configMap) {
+            configMap.delete(event);
+        }
+
+        // Clean up outer maps if no events remain for this handler
+        if (wrappedMap.size === 0) this.wrappedHandlers.delete(handler);
+        if (configMap && configMap.size === 0) this.handlerConfigs.delete(handler);
     }
 
     /**
@@ -113,8 +154,15 @@ class EventBus {
             await this.safeRun(event, handler, payload);
         };
 
-        this.handlerConfigs.set(handler, config);
-        this.wrappedHandlers.set(handler, wrapped);
+        if (!this.handlerConfigs.has(handler)) {
+            this.handlerConfigs.set(handler, new Map());
+        }
+        if (!this.wrappedHandlers.has(handler)) {
+            this.wrappedHandlers.set(handler, new Map());
+        }
+
+        this.handlerConfigs.get(handler).set(event, config);
+        this.wrappedHandlers.get(handler).set(event, wrapped);
         this.adapter.once(event, wrapped);
     }
 
@@ -164,7 +212,8 @@ class EventBus {
         catch (error) {
             console.error(`[EventBus] Error in handler for "${eventName}":`, error);
 
-            const config         = this.handlerConfigs.get(handler) || {};
+            const configMap      = this.handlerConfigs.get(handler);
+            const config         = (configMap && configMap.get(eventName)) || {};
             const notifierNames  = config?.onError?.notify || [];
             const subject        = `Error in EventBus handler for "${eventName}"`;
             const tasks          = [];
@@ -172,7 +221,11 @@ class EventBus {
             for (const name of notifierNames) {
                 const notifier = this.notifiers[name];
                 if (notifier && typeof notifier.notify === 'function') {
-                    tasks.push(notifier.notify(subject, error));
+                    // Wrap in Promise.resolve().then() so synchronous throws
+                    // become rejected promises contained by allSettled.
+                    tasks.push(
+                        Promise.resolve().then(() => notifier.notify(subject, error))
+                    );
                 }
             }
 

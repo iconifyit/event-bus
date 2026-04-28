@@ -162,4 +162,21 @@ describe('PluginLoader', () => {
 
         expect(loader.getRegisteredNames()).toEqual(['alpha', 'beta']);
     });
+
+    // Scenario: A plugin with null entries in the events array should fail
+    // validation with a clear error rather than throwing a TypeError.
+    it('should reject a plugin with null entries in the events array', () => {
+        const plugin = {
+            name   : 'null-event-entry',
+            events : [null, undefined, 42],
+        };
+
+        expect(loader.register(plugin)).toBe(false);
+        expect(console.warn).toHaveBeenCalledWith(
+            expect.stringContaining('null-event-entry'),
+            expect.arrayContaining([
+                expect.stringContaining('events[0] must be a non-null object'),
+            ]),
+        );
+    });
 });

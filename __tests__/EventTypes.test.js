@@ -85,4 +85,18 @@ describe('EventTypes', () => {
         expect(types.TEST_SNAPSHOT).toBe('test.snapshot');
         expect(Object.isFrozen(types)).toBe(true);
     });
+
+    // Scenario: delete on EventTypes should throw (read-only enforcement)
+    it('should prevent deletion of EventTypes properties', () => {
+        registerEventType('TEST_DELETE_TARGET', 'test.delete-target');
+        expect(() => { delete EventTypes.TEST_DELETE_TARGET; }).toThrow(/read-only/);
+        expect(EventTypes.TEST_DELETE_TARGET).toBe('test.delete-target');
+    });
+
+    // Scenario: Object.defineProperty on EventTypes should throw
+    it('should prevent Object.defineProperty on EventTypes', () => {
+        expect(() => {
+            Object.defineProperty(EventTypes, 'INJECTED', { value: 'injected.event' });
+        }).toThrow(/read-only/);
+    });
 });

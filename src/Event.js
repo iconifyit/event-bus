@@ -33,7 +33,7 @@ class Event {
      *
      * @param {string} name - The event name.
      * @param {Object} [data={}] - The event payload.
-     * @returns {Event} A new frozen Event instance.
+     * @returns {Event} A new Event instance with frozen data.
      *
      * @example
      * const event = Event.create('order.confirmation', { orderId: 'abc-123' });
@@ -55,6 +55,13 @@ class Event {
      * @returns {Event} A reconstituted Event instance.
      */
     static fromPayload(payload) {
+        if (!payload || typeof payload !== 'object') {
+            throw new Error('Event.fromPayload requires a non-null object');
+        }
+        if (!payload.name || typeof payload.name !== 'string') {
+            throw new Error('Event.fromPayload requires a payload with a non-empty string "name"');
+        }
+
         const event = new Event(payload.name, payload.data);
         event.timestamp = payload.timestamp || event.timestamp;
         event.actor     = payload.actor || null;

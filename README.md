@@ -126,6 +126,10 @@ Remove all listeners and reset internal handler tracking.
 
 Replace the adapter at runtime (e.g. swap Memory for Redis).
 
+> **Note:** This does not migrate existing listeners to the new adapter. Call `setAdapter()` before registering handlers, or call `clear()` first and re-register after swapping.
+>
+> **TODO:** Add optional listener migration so handlers survive a hot-swap without manual re-registration.
+
 ## Event Object
 
 Every handler receives an `Event` instance with these methods:

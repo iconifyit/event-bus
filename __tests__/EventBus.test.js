@@ -55,10 +55,14 @@ describe('EventBus', () => {
         expect(event.getData()).toEqual({ email: 'john@vectoricons.net' });
     });
 
-    // Scenario: Event data is frozen and cannot be mutated by handlers
+    // Scenario: Event data is frozen and cannot be mutated by handlers.
+    // We assert the value is unchanged rather than expecting a throw,
+    // because in non-strict mode frozen-property assignments fail silently.
     it('should emit immutable Event objects', async () => {
         const handler = jest.fn((event) => {
-            expect(() => { event.data.email = 'hacked'; }).toThrow();
+            const original = event.getData().email;
+            try { event.data.email = 'hacked'; } catch (_) { /* strict mode throws */ }
+            expect(event.getData().email).toBe(original);
         });
         bus.on('user.signup', handler);
         bus.emit('user.signup', { email: 'john@vectoricons.net' });
@@ -196,5 +200,84 @@ describe('EventBus', () => {
     it('should return the same singleton on repeated init calls', () => {
         const bus2 = initEventBus({ adapter: new MemoryAdapter() });
         expect(bus2).toBe(bus);
+    });
+
+    // Scenario: The same handler registered on two different events should
+    // receive both events and off() should only remove the targeted event.
+    it('should track handlers per-event so off() removes the correct one', async () => {
+        const handler = jest.fn();
+        bus.on('event.alpha', handler);
+        bus.on('event.beta', handler);
+
+        // Remove only from alpha
+        bus.off('event.alpha', handler);
+
+        bus.emit('event.alpha', { source: 'alpha' });
+        bus.emit('event.beta', { source: 'beta' });
+
+        await tick();
+
+        // Handler should only fire for beta (alpha was removed)
+        expect(handler).toHaveBeenCalledTimes(1);
+        expect(handler.mock.calls[0][0].getName()).toBe('event.beta');
+    });
+
+    // Scenario: A notifier that throws synchronously should not escape
+    // safeRun — the error should be contained by Promise.allSettled.
+    it('should contain synchronous notifier throws in safeRun', async () => {
+        const syncThrowNotifier = {
+            notify : () => { throw new Error('Sync notifier boom'); },
+        };
+
+        resetEventBus();
+        bus = initEventBus({
+            adapter   : new MemoryAdapter(),
+            notifiers : { broken: syncThrowNotifier },
+        });
+
+        const failingHandler = jest.fn(() => { throw new Error('Handler error'); });
+        bus.on('sync.notifier.test', failingHandler, {
+            onError : { notify: ['broken'] },
+        });
+
+        // Should not throw — sync notifier error is contained
+        bus.emit('sync.notifier.test', {});
+        await tick();
+
+        expect(failingHandler).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('Event.fromPayload', () => {
+
+    // Scenario: fromPayload with null should throw a descriptive error
+    it('should throw for null payload', () => {
+        expect(() => Event.fromPayload(null)).toThrow(/non-null object/);
+    });
+
+    // Scenario: fromPayload with undefined should throw a descriptive error
+    it('should throw for undefined payload', () => {
+        expect(() => Event.fromPayload(undefined)).toThrow(/non-null object/);
+    });
+
+    // Scenario: fromPayload with a non-string name should throw
+    it('should throw when payload.name is missing or not a string', () => {
+        expect(() => Event.fromPayload({})).toThrow(/non-empty string "name"/);
+        expect(() => Event.fromPayload({ name: 123 })).toThrow(/non-empty string "name"/);
+        expect(() => Event.fromPayload({ name: '' })).toThrow(/non-empty string "name"/);
+    });
+
+    // Scenario: fromPayload with valid data should reconstitute the Event
+    it('should reconstitute a valid event from a serialized payload', () => {
+        const original = Event.create('order.shipped', { trackingId: 'TRK-789' })
+            .withMeta({ actor: 'shipping-service', userId: 55, traceId: 'trace-abc' });
+        const serialized = JSON.parse(JSON.stringify(original.toPayload()));
+        const reconstituted = Event.fromPayload(serialized);
+
+        expect(reconstituted.getName()).toBe('order.shipped');
+        expect(reconstituted.getData()).toEqual({ trackingId: 'TRK-789' });
+        expect(reconstituted.getActor()).toBe('shipping-service');
+        expect(reconstituted.getUserId()).toBe(55);
+        expect(reconstituted.getTraceId()).toBe('trace-abc');
     });
 });
