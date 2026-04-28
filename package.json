@@ -1,0 +1,34 @@
+{
+    "name": "@vectoricons.net/event-bus",
+    "version": "1.0.0",
+    "description": "A lightweight, adapter-based EventBus for Node.js with immutable event objects, a plugin registration system, and per-handler error notification.",
+    "main": "index.js",
+    "scripts": {
+        "test": "jest --verbose",
+        "test:watch": "jest --watch --verbose"
+    },
+    "keywords": [
+        "eventbus",
+        "event-bus",
+        "events",
+        "pub-sub",
+        "plugins"
+    ],
+    "author": "Scott Lewis <scott@sketchandbuild.com>",
+    "license": "MIT",
+    "dependencies": {
+        "mitt": "^3.0.1"
+    },
+    "devDependencies": {
+        "jest": "^29.7.0"
+    },
+    "engines": {
+        "node": ">=16.0.0"
+    },
+    "files": [
+        "index.js",
+        "src/",
+        "README.md",
+        "LICENSE"
+    ]
+}
