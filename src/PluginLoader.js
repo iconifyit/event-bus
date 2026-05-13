@@ -8,28 +8,57 @@
  *
  * ## Plugin Contract
  *
- * A plugin is a plain object with:
+ * A plugin is either a **plain object** or a **factory function** that returns
+ * a plain object. Factory functions receive an opaque `context` parameter.
+ *
+ * Plain object shape:
  * - `name` {string} — unique plugin identifier
  * - `events` {Array<Object>} — event handler definitions, each with:
  *   - `type` {string} — the event name to listen for
  *   - `handler` {Function} — async handler receiving an Event instance
- *   - `config` {Object} [optional] — handler config (e.g. `{ onError: { notify: ['slack'] } }`)
+ *   - `config` {Object} [optional] — handler config passed to EventBus.on()
  *   - `once` {boolean} [optional] — if true, handler fires once then unregisters
+ * - `errorHandler` {Function} [optional] — plugin-level error handler
+ *   `(error, event) => Error|*`. Return an Error to escalate; return anything
+ *   else to swallow.
+ *
+ * Factory function shape:
+ * - `(context) => pluginObject`
  *
  * @example
+ * // Plain object plugin
  * const plugin = {
  *     name   : 'welcome-offer',
  *     events : [
  *         {
  *             type    : 'user.verify-email',
  *             handler : async (event) => { await sendWelcomeOffer(event); },
- *             config  : { onError: { notify: ['slack'] } },
  *         },
  *     ],
  * };
  *
- * const loader = new PluginLoader(eventBus);
+ * const loader = new PluginLoader({ eventBus });
  * loader.register(plugin);
+ *
+ * @example
+ * // Factory function plugin with context injection
+ * const pluginFactory = (context) => ({
+ *     name   : 'mailer',
+ *     events : [{
+ *         type    : 'mail.send',
+ *         handler : async (event) => {
+ *             const html = context.templateService.render(event.getData().template);
+ *             await context.mailService.send({ content: html });
+ *         },
+ *     }],
+ *     errorHandler : (error, event) => {
+ *         if (error.code === 'ECONNREFUSED') return undefined; // swallow transient
+ *         return error; // escalate everything else
+ *     },
+ * });
+ *
+ * const loader = new PluginLoader({ eventBus, context: appContext });
+ * loader.register(pluginFactory);
  */
 
 class PluginLoader {
@@ -37,25 +66,58 @@ class PluginLoader {
     /**
      * Create a PluginLoader.
      *
-     * @param {import('./EventBus')} eventBus - The EventBus instance to register handlers on.
+     * @param {Object} options
+     * @param {import('./EventBus')} options.eventBus - The EventBus instance to register handlers on.
+     * @param {Object} [options.context={}] - Opaque context object passed to plugin factory functions.
+     *                                        The PluginLoader has no opinion on what this contains.
      */
-    constructor(eventBus) {
-        if (!eventBus) {
+    constructor(options) {
+        // Backward compatibility: accept a bare EventBus instance (pre-v1.1.0 API)
+        if (options && typeof options.on === 'function' && typeof options.emit === 'function') {
+            this.eventBus = options;
+            this.context  = {};
+        }
+        else if (options && options.eventBus) {
+            this.eventBus = options.eventBus;
+            this.context  = options.context || {};
+        }
+        else {
             throw new Error('PluginLoader requires an EventBus instance');
         }
-        this.eventBus        = eventBus;
+
         this.registeredNames = new Set();
+    }
+
+    /**
+     * Resolve a plugin input to a plain object. If the input is a function
+     * (factory), call it with the context. Otherwise return as-is.
+     *
+     * @param {Object|Function} pluginInput - A plugin definition or factory function.
+     * @returns {Object} The resolved plugin definition.
+     * @private
+     */
+    resolve(pluginInput) {
+        if (typeof pluginInput === 'function') {
+            return pluginInput(this.context);
+        }
+        return pluginInput;
     }
 
     /**
      * Validate and register a single plugin.
      *
-     * @param {Object} plugin - The plugin definition.
-     * @param {string} plugin.name - Unique plugin name.
-     * @param {Array<Object>} plugin.events - Event handler definitions.
+     * Accepts either a plain plugin object or a factory function `(context) => plugin`.
+     * Factory functions are called with the context provided at PluginLoader construction.
+     *
+     * If the plugin defines an `errorHandler`, it is attached to each handler's config
+     * so the EventBus `safeRun` can invoke it on errors.
+     *
+     * @param {Object|Function} pluginInput - The plugin definition or factory function.
      * @returns {boolean} `true` if the plugin was registered, `false` if validation failed.
      */
-    register(plugin) {
+    register(pluginInput) {
+        const plugin = this.resolve(pluginInput);
+
         const errors = this.validate(plugin);
         if (errors.length > 0) {
             console.warn(`[PluginLoader] Skipping invalid plugin "${plugin?.name || 'unknown'}":`, errors);
@@ -69,7 +131,19 @@ class PluginLoader {
 
         for (const eventDef of plugin.events) {
             const method = eventDef.once ? 'once' : 'on';
-            this.eventBus[method](eventDef.type, eventDef.handler, eventDef.config || {});
+
+            // Merge plugin-level errorHandler and pluginName into handler config
+            // so EventBus.safeRun can access them without wrapping the handler.
+            const config = {
+                ...eventDef.config,
+                pluginName : plugin.name,
+            };
+
+            if (typeof plugin.errorHandler === 'function') {
+                config.errorHandler = plugin.errorHandler;
+            }
+
+            this.eventBus[method](eventDef.type, eventDef.handler, config);
         }
 
         this.registeredNames.add(plugin.name);
@@ -79,7 +153,7 @@ class PluginLoader {
     /**
      * Register multiple plugins at once.
      *
-     * @param {Array<Object>} plugins - Array of plugin definitions.
+     * @param {Array<Object|Function>} plugins - Array of plugin definitions or factory functions.
      * @returns {Object} Summary of registration results.
      * @returns {string[]} return.registered - Names of successfully registered plugins.
      * @returns {string[]} return.skipped - Names of skipped plugins.
@@ -88,7 +162,9 @@ class PluginLoader {
         const registered = [];
         const skipped    = [];
 
-        for (const plugin of plugins) {
+        for (const pluginInput of plugins) {
+            // Resolve before registration so we can report the name accurately
+            const plugin  = this.resolve(pluginInput);
             const success = this.register(plugin);
             if (success) {
                 registered.push(plugin.name);
