@@ -1,8 +1,9 @@
 /**
  * EventBus core tests.
  *
- * Tests cover: on/off/once/emit, error notification dispatch,
- * clear, missing arguments, and Event immutability.
+ * Tests cover: on/off/once/emit, two-tier error handling (plugin errorHandler
+ * + eventbus.error emission), recursion guard, clear, missing arguments,
+ * and Event immutability.
  */
 const {
     initEventBus,
@@ -17,21 +18,13 @@ const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
 describe('EventBus', () => {
     let bus;
 
-    // Mock notifiers
-    const mockSlackNotifier = { notify : jest.fn().mockResolvedValue() };
-    const mockEmailNotifier = { notify : jest.fn().mockResolvedValue() };
-
     beforeEach(() => {
         resetEventBus();
         jest.clearAllMocks();
         jest.spyOn(console, 'error').mockImplementation(() => {});
 
         bus = initEventBus({
-            adapter   : new MemoryAdapter(),
-            notifiers : {
-                slack : mockSlackNotifier,
-                email : mockEmailNotifier,
-            },
+            adapter : new MemoryAdapter(),
         });
     });
 
@@ -115,59 +108,79 @@ describe('EventBus', () => {
         expect(bus.emit('some.event', {})).toBe(true);
     });
 
-    // Scenario: A handler that throws triggers Slack and email notifiers per config
-    it('should call configured notifiers when handler throws', async () => {
+    // Scenario: A handler that throws with no errorHandler emits eventbus.error
+    it('should emit eventbus.error when handler throws and no errorHandler exists', async () => {
+        const errorListener = jest.fn();
+        bus.on('eventbus.error', errorListener);
+
         const failingHandler = jest.fn(() => {
             throw new Error('Handler exploded');
         });
 
-        bus.on('order.failed', failingHandler, {
-            onError : { notify: ['slack', 'email'] },
-        });
-
-        bus.emit('order.failed', { orderId: 'ord-broken' });
+        bus.on('order.failed', failingHandler);
+        bus.emit('order.failed', { orderId : 'ord-broken' });
 
         await tick();
 
-        expect(mockSlackNotifier.notify).toHaveBeenCalledTimes(1);
-        expect(mockSlackNotifier.notify).toHaveBeenCalledWith(
-            expect.stringContaining('order.failed'),
-            expect.any(Error)
-        );
-        expect(mockEmailNotifier.notify).toHaveBeenCalledTimes(1);
+        expect(console.error).toHaveBeenCalled();
+        expect(errorListener).toHaveBeenCalledTimes(1);
+
+        const errorEvent = errorListener.mock.calls[0][0];
+        expect(errorEvent.getData().error).toBeInstanceOf(Error);
+        expect(errorEvent.getData().error.message).toBe('Handler exploded');
+        expect(errorEvent.getData().eventName).toBe('order.failed');
     });
 
-    // Scenario: A handler that throws with only slack in config should not call email notifier
-    it('should only call notifiers specified in handler config', async () => {
+    // Scenario: A plugin errorHandler that returns the error triggers eventbus.error
+    it('should emit eventbus.error when plugin errorHandler returns an Error', async () => {
+        const errorListener = jest.fn();
+        bus.on('eventbus.error', errorListener);
+
         const failingHandler = jest.fn(() => {
-            throw new Error('Slack only');
+            throw new Error('SMTP timeout');
         });
 
-        bus.on('partial.error', failingHandler, {
-            onError : { notify: ['slack'] },
+        // errorHandler returns the error → escalate
+        const errorHandler = jest.fn((error) => error);
+
+        bus.on('mail.send', failingHandler, {
+            pluginName   : 'mailer',
+            errorHandler,
         });
 
-        bus.emit('partial.error', {});
+        bus.emit('mail.send', { to : 'user@vectoricons.net' });
 
         await tick();
 
-        expect(mockSlackNotifier.notify).toHaveBeenCalledTimes(1);
-        expect(mockEmailNotifier.notify).not.toHaveBeenCalled();
+        expect(errorHandler).toHaveBeenCalledTimes(1);
+        expect(errorListener).toHaveBeenCalledTimes(1);
+        expect(errorListener.mock.calls[0][0].getData().pluginName).toBe('mailer');
     });
 
-    // Scenario: A handler that throws with no onError config should not call any notifiers
-    it('should not call notifiers when handler has no onError config', async () => {
+    // Scenario: A plugin errorHandler that returns undefined swallows the error
+    it('should swallow error when plugin errorHandler returns non-Error', async () => {
+        const errorListener = jest.fn();
+        bus.on('eventbus.error', errorListener);
+
         const failingHandler = jest.fn(() => {
-            throw new Error('Silent failure');
+            throw new Error('Transient SMTP failure');
         });
 
-        bus.on('silent.error', failingHandler);
-        bus.emit('silent.error', {});
+        // errorHandler returns undefined → swallow
+        const errorHandler = jest.fn(() => undefined);
+
+        bus.on('mail.send', failingHandler, {
+            pluginName   : 'mailer',
+            errorHandler,
+        });
+
+        bus.emit('mail.send', { to : 'user@vectoricons.net' });
 
         await tick();
 
-        expect(mockSlackNotifier.notify).not.toHaveBeenCalled();
-        expect(mockEmailNotifier.notify).not.toHaveBeenCalled();
+        expect(errorHandler).toHaveBeenCalledTimes(1);
+        expect(errorListener).not.toHaveBeenCalled();
+        expect(console.error).toHaveBeenCalled(); // console.error always fires
     });
 
     // Scenario: clear() removes all listeners so subsequent emits are not received
@@ -222,29 +235,32 @@ describe('EventBus', () => {
         expect(handler.mock.calls[0][0].getName()).toBe('event.beta');
     });
 
-    // Scenario: A notifier that throws synchronously should not escape
-    // safeRun — the error should be contained by Promise.allSettled.
-    it('should contain synchronous notifier throws in safeRun', async () => {
-        const syncThrowNotifier = {
-            notify : () => { throw new Error('Sync notifier boom'); },
-        };
+    // Scenario: If an eventbus.error handler itself throws, the error is
+    // contained by console.error — no infinite recursion / re-emission.
+    it('should not re-emit eventbus.error when the error handler throws (recursion guard)', async () => {
+        const errorHandlerCallCount = { value : 0 };
 
-        resetEventBus();
-        bus = initEventBus({
-            adapter   : new MemoryAdapter(),
-            notifiers : { broken: syncThrowNotifier },
+        // An eventbus.error listener that throws
+        bus.on('eventbus.error', () => {
+            errorHandlerCallCount.value++;
+            throw new Error('Error handler also exploded');
         });
 
         const failingHandler = jest.fn(() => { throw new Error('Handler error'); });
-        bus.on('sync.notifier.test', failingHandler, {
-            onError : { notify: ['broken'] },
-        });
+        bus.on('some.event', failingHandler);
 
-        // Should not throw — sync notifier error is contained
-        bus.emit('sync.notifier.test', {});
+        // Should not throw or recurse infinitely
+        bus.emit('some.event', {});
         await tick();
 
         expect(failingHandler).toHaveBeenCalledTimes(1);
+
+        // The eventbus.error handler fired once (not infinitely)
+        expect(errorHandlerCallCount.value).toBe(1);
+
+        // console.error was called for both: the original handler error
+        // and the eventbus.error handler error
+        expect(console.error).toHaveBeenCalledTimes(2);
     });
 });
 

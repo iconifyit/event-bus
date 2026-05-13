@@ -20,7 +20,8 @@
  * bus.on('user.signup', handler, { onError: { notify: ['slack'] } });
  * bus.emit('user.signup', { userId: 42 });
  */
-const Event = require('./Event');
+const Event        = require('./Event');
+const WriteEmitter = require('./WriteEmitter');
 
 class EventBus {
 
@@ -197,10 +198,42 @@ class EventBus {
     }
 
     /**
-     * Execute a handler inside a try/catch envelope. On error, dispatches
-     * to the notifiers specified in the handler's config.
+     * Create a write-only emitter bound to this EventBus instance.
      *
-     * @param {string} eventName - The event name (for error messages).
+     * The returned {@link WriteEmitter} exposes only `emit(type, data)` —
+     * no subscription methods. Place it in the application context so
+     * plugins can publish events without holding a reference to the bus.
+     *
+     * @returns {WriteEmitter} A write-only emitter instance.
+     *
+     * @example
+     * const bus = initEventBus();
+     * const emitter = bus.createEmitter();
+     *
+     * // Place in context for plugins:
+     * context.emitter = emitter;
+     *
+     * // Plugins use it to publish events:
+     * context.emitter.emit('mail.send', { to: 'user@example.com' });
+     */
+    createEmitter() {
+        return new WriteEmitter(this.emit.bind(this));
+    }
+
+    /**
+     * Execute a handler inside a try/catch envelope with two-tier error handling.
+     *
+     * **Error flow:**
+     * 1. `console.error` fires unconditionally (safety net).
+     * 2. If the handler's config includes an `errorHandler` (injected by PluginLoader),
+     *    call `errorHandler(error, event)`:
+     *    - Returns an `Error` instance → emit `eventbus.error` with the returned error.
+     *    - Returns anything else → error is swallowed, no emission.
+     * 3. If no `errorHandler` exists → emit `eventbus.error` with the original error.
+     * 4. **Recursion guard:** if the event being handled IS `eventbus.error` and
+     *    the handler throws, only `console.error` fires — no re-emission.
+     *
+     * @param {string} eventName - The event name (for error context).
      * @param {Function} handler - The original handler function.
      * @param {*} payload - The Event payload passed to the handler.
      * @private
@@ -210,28 +243,54 @@ class EventBus {
             await handler(payload);
         }
         catch (error) {
-            console.error(`[EventBus] Error in handler for "${eventName}":`, error);
+            // Step 1: console.error always fires (non-negotiable safety net)
+            const configMap  = this.handlerConfigs.get(handler);
+            const config     = (configMap && configMap.get(eventName)) || {};
+            const pluginName = config.pluginName || 'unknown';
 
-            const configMap      = this.handlerConfigs.get(handler);
-            const config         = (configMap && configMap.get(eventName)) || {};
-            const notifierNames  = config?.onError?.notify || [];
-            const subject        = `Error in EventBus handler for "${eventName}"`;
-            const tasks          = [];
+            console.error(`[EventBus] Error in handler for "${eventName}" (plugin: ${pluginName}):`, error);
 
-            for (const name of notifierNames) {
-                const notifier = this.notifiers[name];
-                if (notifier && typeof notifier.notify === 'function') {
-                    // Wrap in Promise.resolve().then() so synchronous throws
-                    // become rejected promises contained by allSettled.
-                    tasks.push(
-                        Promise.resolve().then(() => notifier.notify(subject, error))
-                    );
+            // Recursion guard: if we are already handling eventbus.error, stop here
+            if (eventName === 'eventbus.error') {
+                return;
+            }
+
+            // Step 2: Plugin-level error handler (Tier 1)
+            if (typeof config.errorHandler === 'function') {
+                try {
+                    const result = config.errorHandler(error, payload);
+
+                    // If errorHandler returns an Error instance, escalate
+                    if (result instanceof Error) {
+                        this.emit('eventbus.error', {
+                            error      : result,
+                            eventName,
+                            pluginName,
+                        });
+                    }
+                    // Anything else (undefined, null, non-Error) → swallowed
                 }
+                catch (errorHandlerError) {
+                    // The errorHandler itself threw — log and escalate the original error
+                    console.error(
+                        `[EventBus] errorHandler for plugin "${pluginName}" threw:`,
+                        errorHandlerError,
+                    );
+                    this.emit('eventbus.error', {
+                        error      : error,
+                        eventName,
+                        pluginName,
+                    });
+                }
+                return;
             }
 
-            if (tasks.length > 0) {
-                await Promise.allSettled(tasks);
-            }
+            // Step 3: No errorHandler — escalate directly
+            this.emit('eventbus.error', {
+                error      : error,
+                eventName,
+                pluginName,
+            });
         }
     }
 }

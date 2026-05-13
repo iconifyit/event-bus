@@ -35,12 +35,13 @@
  * bus.emit(EventTypes.USER_SIGNUP, { userId: 42, email: 'user@example.com' });
  * ```
  */
-const EventBus          = require('./src/EventBus');
-const Event             = require('./src/Event');
-const PluginLoader      = require('./src/PluginLoader');
-const MemoryAdapter     = require('./src/adapters/MemoryAdapter');
+const EventBus            = require('./src/EventBus');
+const Event               = require('./src/Event');
+const WriteEmitter        = require('./src/WriteEmitter');
+const PluginLoader        = require('./src/PluginLoader');
+const MemoryAdapter       = require('./src/adapters/MemoryAdapter');
 const BaseEventBusAdapter = require('./src/adapters/BaseEventBusAdapter');
-const BaseNotifier      = require('./src/notifiers/BaseNotifier');
+const BaseNotifier        = require('./src/notifiers/BaseNotifier');
 
 const {
     EventTypes,
@@ -109,6 +110,7 @@ module.exports = {
     registerEventType,
     registerEventTypes,
     getEventTypes,
+    WriteEmitter,
     PluginLoader,
     MemoryAdapter,
     BaseEventBusAdapter,
