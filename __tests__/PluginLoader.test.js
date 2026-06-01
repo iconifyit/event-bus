@@ -329,6 +329,46 @@ describe('PluginLoader', () => {
                 template : 'welcome-offer',
             });
         });
+
+        // Scenario: a factory function that throws during invocation. The
+        // module header guarantees invalid plugins are skipped without
+        // crashing the app, so resolve() catches and logs, register() then
+        // sees null and reports it as an invalid plugin.
+        // Uses the console.warn spy installed in the suite-level beforeEach.
+        it('should catch factory exceptions and skip the plugin without crashing', () => {
+            const throwingFactory = () => {
+                throw new Error('factory blew up');
+            };
+
+            const result = loader.register(throwingFactory);
+
+            expect(result).toBe(false);
+            expect(console.warn).toHaveBeenCalledWith(
+                expect.stringContaining('Plugin factory threw during resolution; skipping plugin:'),
+                expect.any(Error),
+            );
+        });
+
+        // Scenario: when registerAll encounters a throwing factory in the
+        // middle of a batch, the rest of the batch still registers cleanly.
+        // resolve() returns null for the broken factory; register() rejects
+        // it; the next iteration continues.
+        it('should continue processing other plugins when one factory throws', () => {
+            const goodHandler = jest.fn();
+            const goodFactory = () => ({
+                name   : 'good-plugin',
+                events : [{ type : 'ok.event', handler : goodHandler }],
+            });
+            const throwingFactory = () => {
+                throw new Error('factory blew up');
+            };
+
+            const summary = loader.registerAll([goodFactory, throwingFactory]);
+
+            expect(summary.registered).toEqual(['good-plugin']);
+            expect(summary.skipped).toHaveLength(1);
+            expect(loader.isRegistered('good-plugin')).toBe(true);
+        });
     });
 
     describe('errorHandler config injection', () => {

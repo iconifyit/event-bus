@@ -301,11 +301,23 @@ class EventBus {
      * 1. `console.error` fires unconditionally (safety net).
      * 2. If the handler's config includes an `errorHandler` (injected by PluginLoader),
      *    call `errorHandler(error, event)`:
-     *    - Returns an `Error` instance → emit `eventbus.error` with the returned error.
-     *    - Returns anything else → error is swallowed, no emission.
-     * 3. If no `errorHandler` exists → emit `eventbus.error` with the original error.
-     * 4. **Recursion guard:** if the event being handled IS `eventbus.error` and
-     *    the handler throws, only `console.error` fires — no re-emission.
+     *    - Returns an `Error` instance → notifier dispatch (Tier 2), then emit
+     *      `eventbus.error` with the returned error.
+     *    - Returns anything else → error is swallowed, NO notifier dispatch and
+     *      NO `eventbus.error` emission.
+     * 3. If no `errorHandler` exists → notifier dispatch (Tier 2), then emit
+     *    `eventbus.error` with the original error.
+     * 4. If the errorHandler itself throws → log it, notifier dispatch (Tier 2)
+     *    for the ORIGINAL error, then emit `eventbus.error` with the original error.
+     * 5. **Recursion guard:** if the event being handled IS `eventbus.error` and
+     *    the handler throws, only `console.error` fires — no re-emission, no
+     *    notifier dispatch (would loop).
+     *
+     * **Notifier dispatch (Tier 2):** Handler config may include
+     * `onError.notify: ['notifierName', ...]`. Each named notifier registered
+     * with the bus has its `notify(subject, error)` method invoked. Notifier
+     * dispatch is fire-and-forget — promises are not awaited and notifier
+     * errors are logged but do not affect the rest of the error chain.
      *
      * @param {string} eventName - The event name (for error context).
      * @param {Function} handler - The original handler function.
@@ -324,7 +336,8 @@ class EventBus {
 
             console.error(`[EventBus] Error in handler for "${eventName}" (plugin: ${pluginName}):`, error);
 
-            // Recursion guard: if we are already handling eventbus.error, stop here
+            // Recursion guard: if we are already handling eventbus.error, stop here.
+            // Skip notifier dispatch and eventbus.error emission to avoid loops.
             if (eventName === 'eventbus.error') {
                 return;
             }
@@ -334,22 +347,27 @@ class EventBus {
                 try {
                     const result = config.errorHandler(error, payload);
 
-                    // If errorHandler returns an Error instance, escalate
+                    // If errorHandler returns an Error instance, dispatch notifiers
+                    // and emit eventbus.error with the (possibly transformed) error.
                     if (result instanceof Error) {
+                        this._dispatchNotifiers(config, eventName, pluginName, result);
                         this.emit('eventbus.error', {
                             error      : result,
                             eventName,
                             pluginName,
                         });
                     }
-                    // Anything else (undefined, null, non-Error) → swallowed
+                    // Anything else (undefined, null, non-Error) → swallowed.
+                    // No notifier dispatch and no eventbus.error emission.
                 }
                 catch (errorHandlerError) {
-                    // The errorHandler itself threw — log and escalate the original error
+                    // The errorHandler itself threw — log and escalate the original error,
+                    // including notifier dispatch for the ORIGINAL error.
                     console.error(
                         `[EventBus] errorHandler for plugin "${pluginName}" threw:`,
                         errorHandlerError,
                     );
+                    this._dispatchNotifiers(config, eventName, pluginName, error);
                     this.emit('eventbus.error', {
                         error      : error,
                         eventName,
@@ -359,12 +377,60 @@ class EventBus {
                 return;
             }
 
-            // Step 3: No errorHandler — escalate directly
+            // Step 3: No errorHandler — dispatch notifiers and escalate directly.
+            this._dispatchNotifiers(config, eventName, pluginName, error);
             this.emit('eventbus.error', {
                 error      : error,
                 eventName,
                 pluginName,
             });
+        }
+    }
+
+    /**
+     * Fire the configured notifiers for a handler error.
+     *
+     * Looks up `config.onError.notify` (an array of notifier names). For
+     * each name, finds the corresponding notifier in `this.notifiers` and
+     * calls its `notify(subject, error)` method. Dispatch is fire-and-forget:
+     * notifier promises are not awaited; rejections are caught and logged so
+     * one bad notifier cannot crash the bus or block other notifiers.
+     *
+     * @param {Object} config     - Resolved handler config.
+     * @param {string} eventName  - The event the handler was listening for.
+     * @param {string} pluginName - The plugin the handler belongs to.
+     * @param {Error}  error      - The error to report.
+     * @private
+     */
+    _dispatchNotifiers(config, eventName, pluginName, error) {
+        const names = config.onError && Array.isArray(config.onError.notify)
+            ? config.onError.notify
+            : null;
+
+        if (!names || names.length === 0) {
+            return;
+        }
+
+        const subject = `[EventBus] "${eventName}" failed in plugin "${pluginName}"`;
+
+        for (const name of names) {
+            const notifier = this.notifiers && this.notifiers[name];
+            if (!notifier || typeof notifier.notify !== 'function') {
+                console.error(
+                    `[EventBus] No notifier named "${name}" registered; skipping.`,
+                );
+                continue;
+            }
+            // Fire-and-forget: do not await; catch rejections so a bad
+            // notifier cannot affect the rest of the error chain.
+            Promise.resolve()
+                .then(() => notifier.notify(subject, error))
+                .catch((notifierError) => {
+                    console.error(
+                        `[EventBus] Notifier "${name}" threw while dispatching error for "${eventName}":`,
+                        notifierError,
+                    );
+                });
         }
     }
 }

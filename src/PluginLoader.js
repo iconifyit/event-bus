@@ -92,13 +92,29 @@ class PluginLoader {
      * Resolve a plugin input to a plain object. If the input is a function
      * (factory), call it with the context. Otherwise return as-is.
      *
+     * If the factory throws, the error is logged and `null` is returned so
+     * the caller can skip the plugin without crashing the application —
+     * matching the module-header guarantee that invalid plugins are skipped
+     * rather than fatal. A null result fails validate() and is reported as
+     * "Factory function threw" by register().
+     *
      * @param {Object|Function} pluginInput - A plugin definition or factory function.
-     * @returns {Object} The resolved plugin definition.
+     * @returns {Object|null} The resolved plugin definition, or null if a
+     *   factory threw during invocation.
      * @private
      */
     resolve(pluginInput) {
         if (typeof pluginInput === 'function') {
-            return pluginInput(this.context);
+            try {
+                return pluginInput(this.context);
+            }
+            catch (err) {
+                console.warn(
+                    '[PluginLoader] Plugin factory threw during resolution; skipping plugin:',
+                    err,
+                );
+                return null;
+            }
         }
         return pluginInput;
     }

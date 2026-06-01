@@ -368,6 +368,271 @@ describe('EventBus', () => {
     });
 });
 
+// ============================================================================
+// Notifier dispatch — verifies the Tier-2 notifier pathway
+// ============================================================================
+
+// Tiny in-memory test notifier so we can verify the dispatch contract end-to-end.
+// Subclasses BaseNotifier just like a real consumer would.
+const { BaseNotifier } = require('../index');
+
+class TestNotifier extends BaseNotifier {
+    constructor(name = 'test') {
+        super();
+        this.name  = name;
+        this.calls = [];
+    }
+    async notify(subject, error = null) {
+        this.calls.push({ subject, error });
+    }
+}
+
+describe('EventBus notifier dispatch (Tier 2)', () => {
+    let bus;
+    let slackNotifier;
+    let emailNotifier;
+
+    beforeEach(() => {
+        resetEventBus();
+        jest.clearAllMocks();
+        jest.spyOn(console, 'error').mockImplementation(() => {});
+
+        slackNotifier = new TestNotifier('slack');
+        emailNotifier = new TestNotifier('email');
+
+        bus = initEventBus({
+            adapter   : new MemoryAdapter(),
+            notifiers : {
+                slack : slackNotifier,
+                email : emailNotifier,
+            },
+        });
+    });
+
+    afterEach(() => {
+        console.error.mockRestore();
+        resetEventBus();
+    });
+
+    // Scenario: handler throws + no errorHandler + onError.notify configured.
+    // Both named notifiers receive the original error with a descriptive
+    // subject that includes the event name and the plugin name.
+    it('should dispatch to all configured notifiers when handler throws with no errorHandler', async () => {
+        const handler = () => { throw new Error('Card declined'); };
+        bus.on('payment.failed', handler, {
+            pluginName : 'billing',
+            onError    : { notify : ['slack', 'email'] },
+        });
+
+        bus.emit('payment.failed', { orderId : 'ord-001' });
+        await tick();
+
+        expect(slackNotifier.calls).toHaveLength(1);
+        expect(slackNotifier.calls[0].subject).toBe('[EventBus] "payment.failed" failed in plugin "billing"');
+        expect(slackNotifier.calls[0].error.message).toBe('Card declined');
+
+        expect(emailNotifier.calls).toHaveLength(1);
+        expect(emailNotifier.calls[0].error.message).toBe('Card declined');
+    });
+
+    // Scenario: plugin-level errorHandler returns an Error, which means
+    // "I want this escalated." Notifier dispatch fires for the returned
+    // (possibly transformed) error, not the original.
+    it('should dispatch notifiers with the returned error when errorHandler returns an Error', async () => {
+        const handler      = () => { throw new Error('raw infra error'); };
+        const errorHandler = () => new Error('pretty user-facing error');
+
+        bus.on('payment.failed', handler, {
+            pluginName   : 'billing',
+            errorHandler,
+            onError      : { notify : ['slack'] },
+        });
+
+        bus.emit('payment.failed', {});
+        await tick();
+
+        expect(slackNotifier.calls).toHaveLength(1);
+        expect(slackNotifier.calls[0].error.message).toBe('pretty user-facing error');
+    });
+
+    // Scenario: errorHandler returns undefined (or any non-Error) — explicit
+    // swallow contract. No notifier dispatch, no eventbus.error emission.
+    it('should NOT dispatch notifiers when errorHandler returns undefined (swallow)', async () => {
+        const handler         = () => { throw new Error('transient'); };
+        const errorHandler    = () => undefined;
+        const errorListener   = jest.fn();
+        bus.on('eventbus.error', errorListener);
+
+        bus.on('payment.failed', handler, {
+            pluginName   : 'billing',
+            errorHandler,
+            onError      : { notify : ['slack'] },
+        });
+
+        bus.emit('payment.failed', {});
+        await tick();
+
+        expect(slackNotifier.calls).toHaveLength(0);
+        expect(errorListener).not.toHaveBeenCalled();
+    });
+
+    // Scenario: errorHandler returns null — same swallow semantics as undefined.
+    it('should NOT dispatch notifiers when errorHandler returns null', async () => {
+        const handler      = () => { throw new Error('transient'); };
+        const errorHandler = () => null;
+
+        bus.on('payment.failed', handler, {
+            pluginName   : 'billing',
+            errorHandler,
+            onError      : { notify : ['slack'] },
+        });
+
+        bus.emit('payment.failed', {});
+        await tick();
+
+        expect(slackNotifier.calls).toHaveLength(0);
+    });
+
+    // Scenario: errorHandler returns a non-Error truthy value — still swallow.
+    // The contract is "Error to escalate, anything else to swallow," NOT
+    // "truthy to escalate."
+    it('should NOT dispatch notifiers when errorHandler returns a non-Error value', async () => {
+        const handler      = () => { throw new Error('transient'); };
+        const errorHandler = () => ({ swallow : true });
+
+        bus.on('payment.failed', handler, {
+            pluginName   : 'billing',
+            errorHandler,
+            onError      : { notify : ['slack'] },
+        });
+
+        bus.emit('payment.failed', {});
+        await tick();
+
+        expect(slackNotifier.calls).toHaveLength(0);
+    });
+
+    // Scenario: errorHandler itself throws — original error escalates,
+    // including notifier dispatch. This is the "errorHandler is broken too,
+    // fall back to original error" path.
+    it('should dispatch notifiers with the ORIGINAL error when errorHandler itself throws', async () => {
+        const handler      = () => { throw new Error('original failure'); };
+        const errorHandler = () => { throw new Error('errorHandler is broken'); };
+
+        bus.on('payment.failed', handler, {
+            pluginName   : 'billing',
+            errorHandler,
+            onError      : { notify : ['slack'] },
+        });
+
+        bus.emit('payment.failed', {});
+        await tick();
+
+        expect(slackNotifier.calls).toHaveLength(1);
+        expect(slackNotifier.calls[0].error.message).toBe('original failure');
+    });
+
+    // Scenario: handler throws inside an 'eventbus.error' subscriber.
+    // Recursion guard: skip notifier dispatch and eventbus.error re-emit
+    // to avoid infinite loops.
+    it('should NOT dispatch notifiers when an eventbus.error handler itself throws (recursion guard)', async () => {
+        bus.on('eventbus.error', () => { throw new Error('error listener exploded'); }, {
+            pluginName : 'alerting',
+            onError    : { notify : ['slack'] },
+        });
+
+        const failingHandler = () => { throw new Error('original'); };
+        bus.on('user.signup', failingHandler, { pluginName : 'auth' });
+
+        bus.emit('user.signup', {});
+        await tick();
+
+        // slack was NOT called for the eventbus.error handler's own failure
+        expect(slackNotifier.calls).toHaveLength(0);
+    });
+
+    // Scenario: handler is configured with a notifier name that wasn't
+    // registered with the bus. The dispatch logs an error but does not
+    // throw and does not block other notifiers.
+    it('should log and skip when a configured notifier name is not registered', async () => {
+        const handler = () => { throw new Error('boom'); };
+        bus.on('payment.failed', handler, {
+            pluginName : 'billing',
+            onError    : { notify : ['slack', 'pager-duty-not-registered', 'email'] },
+        });
+
+        bus.emit('payment.failed', {});
+        await tick();
+
+        // The two real notifiers still fire
+        expect(slackNotifier.calls).toHaveLength(1);
+        expect(emailNotifier.calls).toHaveLength(1);
+
+        // The unknown notifier produces an error log
+        expect(console.error).toHaveBeenCalledWith(
+            expect.stringContaining('No notifier named "pager-duty-not-registered"'),
+        );
+    });
+
+    // Scenario: notifier.notify() itself rejects. Dispatch is fire-and-forget;
+    // the rejection is caught and logged, no exception propagates.
+    it('should catch and log when a notifier rejects', async () => {
+        class FlakyNotifier extends BaseNotifier {
+            async notify() { throw new Error('notifier transport down'); }
+        }
+        // Build a fresh bus with the flaky notifier to bypass beforeEach.
+        resetEventBus();
+        const flaky = new FlakyNotifier();
+        const localBus = initEventBus({
+            adapter   : new MemoryAdapter(),
+            notifiers : { flaky },
+        });
+
+        const handler = () => { throw new Error('boom'); };
+        localBus.on('payment.failed', handler, {
+            pluginName : 'billing',
+            onError    : { notify : ['flaky'] },
+        });
+
+        localBus.emit('payment.failed', {});
+        // Two ticks: one for safeRun to dispatch, one for Promise.resolve.then to settle
+        await tick();
+        await tick();
+
+        expect(console.error).toHaveBeenCalledWith(
+            expect.stringContaining('Notifier "flaky" threw while dispatching error for "payment.failed":'),
+            expect.any(Error),
+        );
+    });
+
+    // Scenario: handler has no onError config at all. No notifier dispatch.
+    // (The eventbus.error event still emits, that is tested in the main suite.)
+    it('should NOT dispatch when handler config has no onError', async () => {
+        const handler = () => { throw new Error('boom'); };
+        bus.on('payment.failed', handler, { pluginName : 'billing' });
+
+        bus.emit('payment.failed', {});
+        await tick();
+
+        expect(slackNotifier.calls).toHaveLength(0);
+        expect(emailNotifier.calls).toHaveLength(0);
+    });
+
+    // Scenario: onError exists but notify is empty array. No dispatch.
+    it('should NOT dispatch when onError.notify is an empty array', async () => {
+        const handler = () => { throw new Error('boom'); };
+        bus.on('payment.failed', handler, {
+            pluginName : 'billing',
+            onError    : { notify : [] },
+        });
+
+        bus.emit('payment.failed', {});
+        await tick();
+
+        expect(slackNotifier.calls).toHaveLength(0);
+    });
+});
+
 describe('Event.fromPayload', () => {
 
     // Scenario: fromPayload with null should throw a descriptive error
