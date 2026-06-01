@@ -408,10 +408,41 @@ describe('EventBus', () => {
     });
 
     // Scenario: when no handlers are subscribed to the event, emitSync
-    // resolves with true without error.
-    it('should resolve true when no handlers are registered', async () => {
+    // resolves to false so callers (e.g. queue workers) can treat the
+    // emit as "nothing delivered" rather than silently succeed. Marking
+    // a queue row SUCCESS based on a no-subscriber emit would silently
+    // drop the message.
+    it('should resolve to false when no handlers are registered', async () => {
         const result = await bus.emitSync('mail.no-subscribers', { userId: 99 });
+        expect(result).toBe(false);
+    });
+
+    // Scenario: emitSync resolves to true (delivery confirmed) when at
+    // least one handler ran. This pairs with the no-subscriber case
+    // above — the boolean is a delivery signal, not just "no error".
+    it('should resolve to true when at least one handler ran', async () => {
+        bus.on('delivery.confirm', async () => { /* runs */ });
+        const result = await bus.emitSync('delivery.confirm', { uuid: 'abc' });
         expect(result).toBe(true);
+    });
+
+    // Scenario: a synchronous throw in one handler must NOT prevent
+    // other handlers from being scheduled. Without the Promise.resolve()
+    // wrapper, Array.map() aborts on the first sync throw and later
+    // handlers never run.
+    it('should schedule every handler even when an earlier handler throws synchronously', async () => {
+        const laterHandler = jest.fn();
+        const syncThrowingHandler = () => { throw new Error('sync boom'); };
+
+        bus.on('parallel.dispatch', syncThrowingHandler);
+        bus.on('parallel.dispatch', laterHandler);
+
+        // emitSync rejects with the first error, but laterHandler MUST
+        // have been scheduled before the rejection is observed.
+        await expect(bus.emitSync('parallel.dispatch', { id: 1 }))
+            .rejects.toThrow('sync boom');
+
+        expect(laterHandler).toHaveBeenCalledTimes(1);
     });
 
     // Scenario: emitSync delivers an immutable Event object (matching emit semantics)

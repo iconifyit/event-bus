@@ -295,24 +295,43 @@ class EventBus {
      * queue worker that needs to mark a row SUCCESS or FAILED based on
      * whether the subscribed plugin successfully delivered).
      *
-     * Handlers run in parallel via `Promise.all`. If multiple handlers
-     * throw, only the first rejection is observed by the caller; other
-     * handlers still complete their work (Promise.all does not cancel).
+     * **Return value as delivery confirmation.** `emitSync()` returns
+     * `false` when there is nothing to deliver to (no event name, or no
+     * subscribers registered for the event) and `true` only when at
+     * least one handler ran to completion. Callers like queue workers
+     * MUST inspect the return value — treating a no-subscriber emit as
+     * success would silently drop messages whose receiver hasn't been
+     * wired up yet.
+     *
+     * **Handler dispatch.** All handlers are scheduled via
+     * `Promise.resolve().then(...)` before any are awaited. This ensures
+     * that a synchronous throw in one handler does not abort the
+     * dispatch loop — every handler in the snapshot is given the chance
+     * to run. `Promise.all` then rejects with the first handler error;
+     * other handlers still complete their work in the background
+     * (Promise.all does not cancel).
      *
      * @param {string} event - The event name.
      * @param {Object} [payload={}] - The event data.
-     * @returns {Promise<boolean>} `true` once all handlers complete,
-     *   `false` if no event name was provided.
+     * @returns {Promise<boolean>} `true` when at least one handler ran
+     *   to completion; `false` if no event name was provided or no
+     *   handlers were registered for the event.
      * @throws {Error} Propagates the first handler error encountered.
      *
      * @example
-     * // In a queue worker:
+     * // In a queue worker — emitSync's return value is the delivery
+     * // confirmation. Treat "no subscriber" the same as a thrown handler.
      * try {
-     *     await bus.emitSync(`mail.${entity.emailTypeId}`, {
+     *     const delivered = await bus.emitSync(`mail.${entity.emailTypeId}`, {
      *         userId    : entity.userId,
      *         messageId : entity.uuid,
      *     });
-     *     await markSuccess(entity.uuid);
+     *     if (!delivered) {
+     *         await recordFailure(entity.uuid, 'no subscriber');
+     *     }
+     *     else {
+     *         await markSuccess(entity.uuid);
+     *     }
      * }
      * catch (err) {
      *     await recordFailure(entity.uuid, err.message);
@@ -321,14 +340,24 @@ class EventBus {
     async emitSync(event, payload) {
         if (!event) return false;
         const handlers = this.handlersByEvent.get(event);
-        if (!handlers || handlers.size === 0) return true;
+        // No subscribers — return false so the caller can treat this as
+        // "nothing delivered" rather than silently succeed. This matters
+        // for queue-worker use cases where success ⇒ row marked SUCCESS.
+        if (!handlers || handlers.size === 0) return false;
         const eventObj = Event.create(event, payload);
         // Snapshot handlers before invocation. Some may be once() registrations
         // that will be removed below; iterating the snapshot keeps the
         // dispatch list stable even if a handler reentrantly modifies the bus.
         const snapshot = Array.from(handlers);
         try {
-            await Promise.all(snapshot.map((handler) => handler(eventObj)));
+            // Wrap each invocation in Promise.resolve().then(...) so that
+            // a synchronous throw in a handler does NOT abort the map() —
+            // every handler is scheduled before Promise.all observes the
+            // first rejection. Without this, a sync throw aborts map()
+            // before later handlers are even started.
+            await Promise.all(
+                snapshot.map((handler) => Promise.resolve().then(() => handler(eventObj))),
+            );
         }
         finally {
             // After dispatch (whether handlers resolved or rejected), remove
@@ -358,10 +387,14 @@ class EventBus {
      * catch (and get logged).
      *
      * Concurrency: ticks fire on wall-clock interval boundaries (standard
-     * setInterval semantics). If a tick fires while the prior tick is still
-     * in flight (its emit promise hasn't settled), the new tick is skipped
-     * by default — NOT delayed. Set `options.allowConcurrent: true` to
-     * disable the in-flight guard so overlapping ticks both proceed.
+     * setInterval semantics). The in-flight guard is only meaningful when
+     * `options.awaitHandlers === true` — that is the only mode where the
+     * tick awaits handler completion, so the guard observably blocks a
+     * subsequent tick while handlers are still running. When
+     * `awaitHandlers: false` (the default), `emit()` returns synchronously
+     * regardless of handler completion, so the guard clears before the
+     * next tick fires and overlap is not actually prevented. Set
+     * `options.allowConcurrent: true` to disable the guard entirely.
      *
      * Lifecycle: the underlying timer is `unref()`d by default so a lone
      * scheduled task will not keep the Node process alive. Pass
