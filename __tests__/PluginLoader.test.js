@@ -343,9 +343,21 @@ describe('PluginLoader', () => {
             const result = loader.register(throwingFactory);
 
             expect(result).toBe(false);
+            // resolve() logs the underlying error
             expect(console.warn).toHaveBeenCalledWith(
                 expect.stringContaining('Plugin factory threw during resolution; skipping plugin:'),
                 expect.any(Error),
+            );
+            // register() emits the specific "factory function threw" skip
+            // message rather than the generic "Plugin must be a non-null
+            // object" message. Two separate warn calls.
+            expect(console.warn).toHaveBeenCalledWith(
+                expect.stringContaining('Skipping plugin: factory function threw during resolution'),
+            );
+            // Ensure the generic-object message did NOT also fire.
+            expect(console.warn).not.toHaveBeenCalledWith(
+                expect.stringContaining('Plugin must be a non-null object'),
+                expect.anything(),
             );
         });
 

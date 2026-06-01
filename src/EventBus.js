@@ -69,6 +69,18 @@ class EventBus {
         this.handlersByEvent = new Map();
 
         /**
+         * Maps event name → Set of handlers registered via once().
+         * After emitSync() invokes a one-shot handler, it consults this
+         * index to remove the handler from all bookkeeping. The adapter
+         * (mitt) handles its own once-removal on the emit() path, but
+         * emitSync calls the raw handler directly, so it needs an
+         * independent record of which handlers are one-shot.
+         * @type {Map<string, Set<Function>>}
+         * @private
+         */
+        this.onceHandlers = new Map();
+
+        /**
          * Maps interval handle → metadata for an active onInterval registration.
          * Each entry holds the underlying NodeJS.Timer, the event name to fire,
          * the payload, and the per-registration options (allowConcurrent,
@@ -126,6 +138,16 @@ class EventBus {
     on(event, handler, config = {}) {
         if (!event || !handler) return;
 
+        // Reject duplicate registrations of the same (event, handler) pair.
+        // Without this, mitt's emit would invoke the handler N times while
+        // emitSync — which uses the deduplicated handlersByEvent index —
+        // would invoke it once. Rejecting duplicates aligns the two
+        // dispatch paths and matches normal pub/sub semantics.
+        const existingByEvent = this.handlersByEvent.get(event);
+        if (existingByEvent && existingByEvent.has(handler)) {
+            return;
+        }
+
         const wrapped = async (payload) => {
             await this.safeRun(event, handler, payload);
         };
@@ -175,6 +197,12 @@ class EventBus {
             if (handlersForEvent.size === 0) this.handlersByEvent.delete(event);
         }
 
+        const onceForEvent = this.onceHandlers.get(event);
+        if (onceForEvent) {
+            onceForEvent.delete(handler);
+            if (onceForEvent.size === 0) this.onceHandlers.delete(event);
+        }
+
         // Clean up outer maps if no events remain for this handler
         if (wrappedMap.size === 0) this.wrappedHandlers.delete(handler);
         if (configMap && configMap.size === 0) this.handlerConfigs.delete(handler);
@@ -191,8 +219,24 @@ class EventBus {
     once(event, handler, config = {}) {
         if (!event || !handler) return;
 
+        // Reject duplicate registrations — same rationale as on().
+        const existingByEvent = this.handlersByEvent.get(event);
+        if (existingByEvent && existingByEvent.has(handler)) {
+            return;
+        }
+
+        // The adapter removes the wrapped function after the first fire,
+        // but we also need to clean our internal indexes so emitSync
+        // does not re-invoke the original handler and so we do not leak
+        // references over time. Cleanup runs in finally so it happens
+        // even if the handler throws.
         const wrapped = async (payload) => {
-            await this.safeRun(event, handler, payload);
+            try {
+                await this.safeRun(event, handler, payload);
+            }
+            finally {
+                this.off(event, handler);
+            }
         };
 
         if (!this.handlerConfigs.has(handler)) {
@@ -204,10 +248,14 @@ class EventBus {
         if (!this.handlersByEvent.has(event)) {
             this.handlersByEvent.set(event, new Set());
         }
+        if (!this.onceHandlers.has(event)) {
+            this.onceHandlers.set(event, new Set());
+        }
 
         this.handlerConfigs.get(handler).set(event, config);
         this.wrappedHandlers.get(handler).set(event, wrapped);
         this.handlersByEvent.get(event).add(handler);
+        this.onceHandlers.get(event).add(handler);
         this.adapter.once(event, wrapped);
     }
 
@@ -275,9 +323,27 @@ class EventBus {
         const handlers = this.handlersByEvent.get(event);
         if (!handlers || handlers.size === 0) return true;
         const eventObj = Event.create(event, payload);
-        await Promise.all(
-            Array.from(handlers).map((handler) => handler(eventObj)),
-        );
+        // Snapshot handlers before invocation. Some may be once() registrations
+        // that will be removed below; iterating the snapshot keeps the
+        // dispatch list stable even if a handler reentrantly modifies the bus.
+        const snapshot = Array.from(handlers);
+        try {
+            await Promise.all(snapshot.map((handler) => handler(eventObj)));
+        }
+        finally {
+            // After dispatch (whether handlers resolved or rejected), remove
+            // any one-shot handlers from the bookkeeping so emitSync does not
+            // re-invoke them on a subsequent call. Runs in finally so cleanup
+            // happens even when a handler rejects.
+            const onceSet = this.onceHandlers.get(event);
+            if (onceSet && onceSet.size > 0) {
+                for (const handler of snapshot) {
+                    if (onceSet.has(handler)) {
+                        this.off(event, handler);
+                    }
+                }
+            }
+        }
         return true;
     }
 
@@ -288,29 +354,31 @@ class EventBus {
      * `options.runImmediately === true`. The scheduler emits via `bus.emit`
      * by default; subscribers receive the event through the usual pub/sub
      * path with safeRun. Pass `options.awaitHandlers === true` to use
-     * `bus.emitSync` instead — the next tick is then scheduled relative to
-     * handler completion rather than to the previous tick's start.
+     * `bus.emitSync` instead so handler errors propagate to the tick's
+     * catch (and get logged).
      *
-     * Concurrency: if a tick fires while the prior tick is still in flight
-     * (its emit promise hasn't settled), the new tick is skipped by default.
-     * Set `options.allowConcurrent: true` to disable the in-flight guard.
+     * Concurrency: ticks fire on wall-clock interval boundaries (standard
+     * setInterval semantics). If a tick fires while the prior tick is still
+     * in flight (its emit promise hasn't settled), the new tick is skipped
+     * by default — NOT delayed. Set `options.allowConcurrent: true` to
+     * disable the in-flight guard so overlapping ticks both proceed.
      *
      * Lifecycle: the underlying timer is `unref()`d by default so a lone
      * scheduled task will not keep the Node process alive. Pass
      * `options.keepAlive: true` to invert this. `offInterval(handle)` cancels;
      * `clear()` cancels every scheduled task on the bus.
      *
-     * @param {number} intervalMs            - Tick period in milliseconds. Must be a positive finite integer.
+     * @param {number} intervalMs            - Tick period in milliseconds. Must be a positive integer.
      * @param {string} eventName             - Event to emit on each tick.
      * @param {Object} [payload={}]          - Event payload.
      * @param {Object} [options={}]          - Scheduling options.
      * @param {boolean} [options.awaitHandlers=false] - Use emitSync (await handlers) instead of emit.
      * @param {boolean} [options.allowConcurrent=false] - Allow ticks to overlap when prior is still in flight.
-     * @param {number}  [options.maxRuns]    - Auto-offInterval after N tick firings. Default unbounded.
+     * @param {number}  [options.maxRuns]    - Auto-offInterval after N tick firings. Must be a positive integer when set. Default unbounded.
      * @param {boolean} [options.runImmediately=false] - Fire one tick at registration before the first scheduled tick.
      * @param {boolean} [options.keepAlive=false] - Do not unref() the timer (keeps Node process alive).
      * @returns {number} An integer handle suitable for `offInterval`.
-     * @throws {Error} If `intervalMs` is not a positive finite integer or `eventName` is falsy.
+     * @throws {Error} If `intervalMs` is not a positive integer, `eventName` is falsy, or `options.maxRuns` is not a positive integer when set.
      *
      * @example
      * const handle = bus.onInterval(60_000, 'mail.process-queue', { batchSize: 5 });
@@ -319,21 +387,21 @@ class EventBus {
      * bus.offInterval(handle);
      *
      * @example
-     * // Await handlers so the next tick waits for the prior to complete:
+     * // Await handlers so the in-flight guard is keyed off handler completion:
      * bus.onInterval(5000, 'metrics.flush', {}, { awaitHandlers: true });
      */
     onInterval(intervalMs, eventName, payload = {}, options = {}) {
-        if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+        if (!Number.isInteger(intervalMs) || intervalMs <= 0) {
             throw new Error(
-                `[EventBus] onInterval requires a positive finite intervalMs; got: ${intervalMs}`,
+                `[EventBus] onInterval requires a positive integer intervalMs; got: ${intervalMs}`,
             );
         }
         if (!eventName || typeof eventName !== 'string') {
             throw new Error('[EventBus] onInterval requires a non-empty string eventName');
         }
-        if (options.maxRuns !== undefined && (!Number.isFinite(options.maxRuns) || options.maxRuns <= 0)) {
+        if (options.maxRuns !== undefined && (!Number.isInteger(options.maxRuns) || options.maxRuns <= 0)) {
             throw new Error(
-                `[EventBus] onInterval options.maxRuns must be a positive finite integer when set; got: ${options.maxRuns}`,
+                `[EventBus] onInterval options.maxRuns must be a positive integer when set; got: ${options.maxRuns}`,
             );
         }
 
@@ -425,6 +493,7 @@ class EventBus {
         this.handlerConfigs  = new WeakMap();
         this.wrappedHandlers = new WeakMap();
         this.handlersByEvent = new Map();
+        this.onceHandlers    = new Map();
         for (const entry of this.intervals.values()) {
             clearInterval(entry.timer);
         }
@@ -505,7 +574,12 @@ class EventBus {
             // Step 2: Plugin-level error handler (Tier 1)
             if (typeof config.errorHandler === 'function') {
                 try {
-                    const result = config.errorHandler(error, payload);
+                    // Await the result so async errorHandlers — a common
+                    // pattern — are correctly inspected. Without the await,
+                    // an async errorHandler's returned Promise would never be
+                    // instanceof Error and the result would silently fall
+                    // into the swallow branch.
+                    const result = await config.errorHandler(error, payload);
 
                     // If errorHandler returns an Error instance, dispatch notifiers
                     // and emit eventbus.error with the (possibly transformed) error.

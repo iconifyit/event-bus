@@ -209,6 +209,115 @@ describe('EventBus', () => {
         expect(handlerB).toHaveBeenCalledTimes(1);
     });
 
+    // Scenario: registering the same (event, handler) pair a second time is
+    // a no-op. Without dedup, emit() (via mitt) would fire the handler twice
+    // while emitSync() would fire it once — inconsistent. Dedup keeps both
+    // paths aligned and matches normal pub/sub semantics.
+    it('should reject duplicate on() registrations of the same (event, handler) pair', async () => {
+        const handler = jest.fn();
+        bus.on('dedup.event', handler);
+        bus.on('dedup.event', handler);  // duplicate
+
+        bus.emit('dedup.event', {});
+        await tick();
+        expect(handler).toHaveBeenCalledTimes(1);
+
+        // emitSync should also fire it once
+        await bus.emitSync('dedup.event', {});
+        expect(handler).toHaveBeenCalledTimes(2);
+    });
+
+    // Scenario: same dedup contract applies to once().
+    it('should reject duplicate once() registrations of the same (event, handler) pair', async () => {
+        const handler = jest.fn();
+        bus.once('one-shot.event', handler);
+        bus.once('one-shot.event', handler);  // duplicate
+
+        bus.emit('one-shot.event', {});
+        await tick();
+        expect(handler).toHaveBeenCalledTimes(1);
+    });
+
+    // Scenario: a once() handler is removed from handlersByEvent after firing,
+    // so subsequent emitSync() does not re-invoke it. The adapter already
+    // removes the wrapped function from its event list; the bus also has
+    // to clean the unwrapped index used by emitSync.
+    it('should not re-invoke a fired once() handler via emitSync', async () => {
+        const handler = jest.fn();
+        bus.once('one-shot.emitsync', handler);
+
+        await bus.emitSync('one-shot.emitsync', { firstCall: true });
+        expect(handler).toHaveBeenCalledTimes(1);
+
+        await bus.emitSync('one-shot.emitsync', { secondCall: true });
+        expect(handler).toHaveBeenCalledTimes(1);
+
+        // The handlersByEvent index should be empty for this event now.
+        const index = bus.handlersByEvent.get('one-shot.emitsync');
+        expect(!index || index.size === 0).toBe(true);
+    });
+
+    // Scenario: even when the once() handler throws, cleanup still runs.
+    // safeRun swallows the error; the finally clause unregisters.
+    it('should clean up once() handlers even when the handler throws', async () => {
+        const handler = jest.fn(() => { throw new Error('handler threw'); });
+        bus.once('throws.once', handler);
+
+        bus.emit('throws.once', {});
+        await tick();
+        expect(handler).toHaveBeenCalledTimes(1);
+
+        // Second emit: handler was unregistered in finally
+        bus.emit('throws.once', {});
+        await tick();
+        expect(handler).toHaveBeenCalledTimes(1);
+    });
+
+    // Scenario: an async errorHandler returns a Promise. Without awaiting,
+    // the returned Promise is not an Error and the swallow branch wrongly
+    // fires. With await, the resolved Error is treated correctly.
+    it('should await an async errorHandler so its returned Error escalates', async () => {
+        const handler         = () => { throw new Error('raw infra error'); };
+        const asyncErrorHandler = async () => new Error('pretty user error');
+        const errorListener   = jest.fn();
+        bus.on('eventbus.error', errorListener);
+
+        bus.on('payment.failed', handler, {
+            pluginName   : 'billing',
+            errorHandler : asyncErrorHandler,
+        });
+
+        bus.emit('payment.failed', {});
+        await tick();
+        // Allow the awaited errorHandler promise to settle
+        await tick();
+
+        expect(errorListener).toHaveBeenCalledTimes(1);
+        const payload = errorListener.mock.calls[0][0].getData();
+        expect(payload.error.message).toBe('pretty user error');
+    });
+
+    // Scenario: an async errorHandler that resolves with undefined (i.e.
+    // "swallow") still works. The contract is "resolved Error escalates;
+    // anything else swallows."
+    it('should swallow an async errorHandler that resolves with undefined', async () => {
+        const handler         = () => { throw new Error('transient'); };
+        const asyncErrorHandler = async () => undefined;
+        const errorListener   = jest.fn();
+        bus.on('eventbus.error', errorListener);
+
+        bus.on('payment.failed', handler, {
+            pluginName   : 'billing',
+            errorHandler : asyncErrorHandler,
+        });
+
+        bus.emit('payment.failed', {});
+        await tick();
+        await tick();
+
+        expect(errorListener).not.toHaveBeenCalled();
+    });
+
     // Scenario: initEventBus returns the same singleton on subsequent calls
     it('should return the same singleton on repeated init calls', () => {
         const bus2 = initEventBus({ adapter: new MemoryAdapter() });
@@ -814,13 +923,17 @@ describe('EventBus.onInterval', () => {
         expect(bus.intervals.size).toBe(0);
     });
 
-    // Scenario: invalid intervalMs is rejected at registration.
-    it('should throw when intervalMs is not a positive finite integer', () => {
-        expect(() => bus.onInterval(0, 'x')).toThrow(/positive finite intervalMs/);
-        expect(() => bus.onInterval(-1, 'x')).toThrow(/positive finite intervalMs/);
-        expect(() => bus.onInterval(Infinity, 'x')).toThrow(/positive finite intervalMs/);
-        expect(() => bus.onInterval(NaN, 'x')).toThrow(/positive finite intervalMs/);
-        expect(() => bus.onInterval('5000', 'x')).toThrow(/positive finite intervalMs/);
+    // Scenario: invalid intervalMs is rejected at registration. The contract
+    // is positive INTEGER ms, so fractional values like 0.5 are rejected too.
+    it('should throw when intervalMs is not a positive integer', () => {
+        expect(() => bus.onInterval(0, 'x')).toThrow(/positive integer intervalMs/);
+        expect(() => bus.onInterval(-1, 'x')).toThrow(/positive integer intervalMs/);
+        expect(() => bus.onInterval(Infinity, 'x')).toThrow(/positive integer intervalMs/);
+        expect(() => bus.onInterval(NaN, 'x')).toThrow(/positive integer intervalMs/);
+        expect(() => bus.onInterval('5000', 'x')).toThrow(/positive integer intervalMs/);
+        // Fractional value rejected (was accepted under the old Number.isFinite check)
+        expect(() => bus.onInterval(0.5, 'x')).toThrow(/positive integer intervalMs/);
+        expect(() => bus.onInterval(1.5, 'x')).toThrow(/positive integer intervalMs/);
     });
 
     // Scenario: invalid eventName is rejected at registration.
@@ -830,11 +943,13 @@ describe('EventBus.onInterval', () => {
         expect(() => bus.onInterval(1000, 42)).toThrow(/non-empty string eventName/);
     });
 
-    // Scenario: invalid maxRuns is rejected at registration.
-    it('should throw when maxRuns is not a positive finite integer', () => {
-        expect(() => bus.onInterval(1000, 'x', {}, { maxRuns: 0 })).toThrow(/maxRuns must be a positive finite integer/);
-        expect(() => bus.onInterval(1000, 'x', {}, { maxRuns: -1 })).toThrow(/maxRuns must be a positive finite integer/);
-        expect(() => bus.onInterval(1000, 'x', {}, { maxRuns: Infinity })).toThrow(/maxRuns must be a positive finite integer/);
+    // Scenario: invalid maxRuns is rejected at registration. Integer contract.
+    it('should throw when maxRuns is not a positive integer', () => {
+        expect(() => bus.onInterval(1000, 'x', {}, { maxRuns: 0 })).toThrow(/maxRuns must be a positive integer/);
+        expect(() => bus.onInterval(1000, 'x', {}, { maxRuns: -1 })).toThrow(/maxRuns must be a positive integer/);
+        expect(() => bus.onInterval(1000, 'x', {}, { maxRuns: Infinity })).toThrow(/maxRuns must be a positive integer/);
+        // Fractional value rejected
+        expect(() => bus.onInterval(1000, 'x', {}, { maxRuns: 2.5 })).toThrow(/maxRuns must be a positive integer/);
     });
 
     // Scenario: timer is unref()d by default. We verify by spying on the

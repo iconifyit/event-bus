@@ -95,8 +95,10 @@ class PluginLoader {
      * If the factory throws, the error is logged and `null` is returned so
      * the caller can skip the plugin without crashing the application —
      * matching the module-header guarantee that invalid plugins are skipped
-     * rather than fatal. A null result fails validate() and is reported as
-     * "Factory function threw" by register().
+     * rather than fatal. A null result fails validate(); `register()`
+     * additionally checks whether the original input was a factory and
+     * reports the skip with a specific "Factory function threw" message
+     * rather than the generic "Plugin must be a non-null object."
      *
      * @param {Object|Function} pluginInput - A plugin definition or factory function.
      * @returns {Object|null} The resolved plugin definition, or null if a
@@ -133,6 +135,15 @@ class PluginLoader {
      */
     register(pluginInput) {
         const plugin = this.resolve(pluginInput);
+
+        // Distinguish "factory threw" from "plugin is otherwise invalid":
+        // resolve() returns null for both null inputs AND thrown factories.
+        // We only emit the specific message when the input was a factory.
+        // resolve() already logged the underlying error via console.warn.
+        if (plugin === null && typeof pluginInput === 'function') {
+            console.warn('[PluginLoader] Skipping plugin: factory function threw during resolution');
+            return false;
+        }
 
         const errors = this.validate(plugin);
         if (errors.length > 0) {

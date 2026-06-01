@@ -145,3 +145,6 @@ vite.config.ts.timestamp-*
 !.codex/instructions.md
 .github/copilot/*
 !.github/copilot/instructions.md
+
+# Local agent docs (kept on disk, not committed)
+AGENTS.md
