@@ -57,6 +57,16 @@ class EventBus {
          * @private
          */
         this.wrappedHandlers = new WeakMap();
+
+        /**
+         * Maps event name → Set of original (unwrapped) handlers.
+         * Used by emitSync() to invoke handlers directly so the caller
+         * can await completion and observe handler errors. emit() does
+         * not use this map; it dispatches via the adapter (wrapped).
+         * @type {Map<string, Set<Function>>}
+         * @private
+         */
+        this.handlersByEvent = new Map();
     }
 
     /**
@@ -106,9 +116,13 @@ class EventBus {
         if (!this.wrappedHandlers.has(handler)) {
             this.wrappedHandlers.set(handler, new Map());
         }
+        if (!this.handlersByEvent.has(event)) {
+            this.handlersByEvent.set(event, new Set());
+        }
 
         this.handlerConfigs.get(handler).set(event, config);
         this.wrappedHandlers.get(handler).set(event, wrapped);
+        this.handlersByEvent.get(event).add(handler);
         this.adapter.on(event, wrapped);
     }
 
@@ -133,6 +147,12 @@ class EventBus {
         const configMap = this.handlerConfigs.get(handler);
         if (configMap) {
             configMap.delete(event);
+        }
+
+        const handlersForEvent = this.handlersByEvent.get(event);
+        if (handlersForEvent) {
+            handlersForEvent.delete(handler);
+            if (handlersForEvent.size === 0) this.handlersByEvent.delete(event);
         }
 
         // Clean up outer maps if no events remain for this handler
@@ -161,9 +181,13 @@ class EventBus {
         if (!this.wrappedHandlers.has(handler)) {
             this.wrappedHandlers.set(handler, new Map());
         }
+        if (!this.handlersByEvent.has(event)) {
+            this.handlersByEvent.set(event, new Set());
+        }
 
         this.handlerConfigs.get(handler).set(event, config);
         this.wrappedHandlers.get(handler).set(event, wrapped);
+        this.handlersByEvent.get(event).add(handler);
         this.adapter.once(event, wrapped);
     }
 
@@ -189,12 +213,62 @@ class EventBus {
     }
 
     /**
+     * Emit an event and await handler completion.
+     *
+     * Unlike `emit()`, which is fire-and-forget and routes through the
+     * adapter's wrapped (safeRun) handlers, `emitSync()` invokes the
+     * original (unwrapped) handlers directly and returns a Promise that
+     * resolves when all handlers complete or rejects with the first
+     * handler error.
+     *
+     * This bypasses the two-tier error notification chain — the caller
+     * is responsible for catching and handling errors. Use this when the
+     * caller needs to know the outcome of handler execution (e.g. a
+     * queue worker that needs to mark a row SUCCESS or FAILED based on
+     * whether the subscribed plugin successfully delivered).
+     *
+     * Handlers run in parallel via `Promise.all`. If multiple handlers
+     * throw, only the first rejection is observed by the caller; other
+     * handlers still complete their work (Promise.all does not cancel).
+     *
+     * @param {string} event - The event name.
+     * @param {Object} [payload={}] - The event data.
+     * @returns {Promise<boolean>} `true` once all handlers complete,
+     *   `false` if no event name was provided.
+     * @throws {Error} Propagates the first handler error encountered.
+     *
+     * @example
+     * // In a queue worker:
+     * try {
+     *     await bus.emitSync(`mail.${entity.emailTypeId}`, {
+     *         userId    : entity.userId,
+     *         messageId : entity.uuid,
+     *     });
+     *     await markSuccess(entity.uuid);
+     * }
+     * catch (err) {
+     *     await recordFailure(entity.uuid, err.message);
+     * }
+     */
+    async emitSync(event, payload) {
+        if (!event) return false;
+        const handlers = this.handlersByEvent.get(event);
+        if (!handlers || handlers.size === 0) return true;
+        const eventObj = Event.create(event, payload);
+        await Promise.all(
+            Array.from(handlers).map((handler) => handler(eventObj)),
+        );
+        return true;
+    }
+
+    /**
      * Remove all listeners and reset internal state.
      */
     clear() {
         this.adapter.clear();
         this.handlerConfigs  = new WeakMap();
         this.wrappedHandlers = new WeakMap();
+        this.handlersByEvent = new Map();
     }
 
     /**

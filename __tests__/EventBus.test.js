@@ -262,6 +262,110 @@ describe('EventBus', () => {
         // and the eventbus.error handler error
         expect(console.error).toHaveBeenCalledTimes(2);
     });
+
+    // ========================================================================
+    // emitSync — awaitable emission for callers that need handler outcomes
+    // ========================================================================
+
+    // Scenario: emitSync resolves only after all handlers have completed.
+    // The two handlers each delay 30ms; emitSync must not resolve before then.
+    it('should await all handlers to complete before resolving', async () => {
+        const completed = { handlerA: false, handlerB: false };
+        bus.on('mail.welcome-offer', async () => {
+            await new Promise((r) => setTimeout(r, 30));
+            completed.handlerA = true;
+        });
+        bus.on('mail.welcome-offer', async () => {
+            await new Promise((r) => setTimeout(r, 30));
+            completed.handlerB = true;
+        });
+
+        await bus.emitSync('mail.welcome-offer', { userId: 42, messageId: 'uuid-001' });
+
+        expect(completed.handlerA).toBe(true);
+        expect(completed.handlerB).toBe(true);
+    });
+
+    // Scenario: emitSync rejects when a handler throws. The caller must be
+    // able to observe and respond to the error.
+    it('should reject with the handler error when a handler throws', async () => {
+        bus.on('mail.welcome-offer', async () => {
+            throw new Error('SMTP connection refused');
+        });
+
+        await expect(
+            bus.emitSync('mail.welcome-offer', { userId: 42, messageId: 'uuid-002' }),
+        ).rejects.toThrow('SMTP connection refused');
+    });
+
+    // Scenario: when no handlers are subscribed to the event, emitSync
+    // resolves with true without error.
+    it('should resolve true when no handlers are registered', async () => {
+        const result = await bus.emitSync('mail.no-subscribers', { userId: 99 });
+        expect(result).toBe(true);
+    });
+
+    // Scenario: emitSync delivers an immutable Event object (matching emit semantics)
+    it('should deliver an immutable Event object to handlers', async () => {
+        let received;
+        bus.on('mail.welcome-offer', async (event) => {
+            received = event;
+        });
+
+        await bus.emitSync('mail.welcome-offer', { userId: 42, messageId: 'uuid-003' });
+
+        expect(received).toBeInstanceOf(Event);
+        expect(received.getName()).toBe('mail.welcome-offer');
+        expect(received.getData()).toEqual({ userId: 42, messageId: 'uuid-003' });
+    });
+
+    // Scenario: emitSync returns false when called with no event name (parity with emit())
+    it('should return false when called with no event name', async () => {
+        const result = await bus.emitSync();
+        expect(result).toBe(false);
+    });
+
+    // Scenario: emitSync bypasses safeRun, so handler errors do NOT trigger
+    // the eventbus.error chain. This is the documented trade-off — the caller
+    // is responsible for error handling.
+    it('should NOT emit eventbus.error when a handler throws (caller handles errors)', async () => {
+        const errorListener = jest.fn();
+        bus.on('eventbus.error', errorListener);
+
+        bus.on('mail.welcome-offer', async () => {
+            throw new Error('Boom');
+        });
+
+        await expect(
+            bus.emitSync('mail.welcome-offer', { userId: 42 }),
+        ).rejects.toThrow('Boom');
+
+        // eventbus.error was not emitted — safeRun is bypassed for emitSync
+        expect(errorListener).not.toHaveBeenCalled();
+    });
+
+    // Scenario: handlers removed via off() are not invoked by emitSync.
+    // Verifies that off() correctly maintains the handlersByEvent index.
+    it('should not invoke handlers that were removed via off()', async () => {
+        const handler = jest.fn();
+        bus.on('mail.welcome-offer', handler);
+        bus.off('mail.welcome-offer', handler);
+
+        await bus.emitSync('mail.welcome-offer', { userId: 42 });
+
+        expect(handler).not.toHaveBeenCalled();
+    });
+
+    // Scenario: clear() resets handlersByEvent so emitSync no longer dispatches
+    it('should not invoke handlers after clear()', async () => {
+        const handler = jest.fn();
+        bus.on('mail.welcome-offer', handler);
+        bus.clear();
+
+        await bus.emitSync('mail.welcome-offer', { userId: 42 });
+
+        expect(handler).not.toHaveBeenCalled();
+    });
 });
 
 describe('Event.fromPayload', () => {
