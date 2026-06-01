@@ -633,6 +633,264 @@ describe('EventBus notifier dispatch (Tier 2)', () => {
     });
 });
 
+// ============================================================================
+// onInterval — scheduled emission via setInterval
+// ============================================================================
+
+describe('EventBus.onInterval', () => {
+    let bus;
+
+    beforeEach(() => {
+        resetEventBus();
+        jest.useFakeTimers();
+        jest.spyOn(console, 'error').mockImplementation(() => {});
+        bus = initEventBus({ adapter : new MemoryAdapter() });
+    });
+
+    afterEach(() => {
+        bus.clear();
+        console.error.mockRestore();
+        jest.useRealTimers();
+        resetEventBus();
+    });
+
+    // Scenario: a registered interval fires the named event with the configured
+    // payload after intervalMs. The first tick is deferred — nothing fires
+    // before the timer expires.
+    it('should emit the configured event with payload on each tick', () => {
+        const handler = jest.fn();
+        bus.on('mail.poll', handler);
+        bus.onInterval(1000, 'mail.poll', { batchSize: 5 });
+
+        // No tick before the interval expires
+        jest.advanceTimersByTime(999);
+        expect(handler).not.toHaveBeenCalled();
+
+        // First tick at exactly intervalMs
+        jest.advanceTimersByTime(1);
+        expect(handler).toHaveBeenCalledTimes(1);
+        expect(handler.mock.calls[0][0].getData()).toEqual({ batchSize: 5 });
+
+        // Second tick at 2 * intervalMs
+        jest.advanceTimersByTime(1000);
+        expect(handler).toHaveBeenCalledTimes(2);
+    });
+
+    // Scenario: runImmediately fires a tick at registration before the
+    // first scheduled one. This is "fire on start" semantics for callers
+    // that want the work to happen immediately AND on schedule afterward.
+    it('should fire one tick at registration when runImmediately is true', async () => {
+        const handler = jest.fn();
+        bus.on('reports.flush', handler);
+        bus.onInterval(60_000, 'reports.flush', {}, { runImmediately: true });
+
+        // The immediate fire is scheduled via Promise.resolve so it runs
+        // on the next microtask; advance the timers + flush promises.
+        await Promise.resolve();
+        expect(handler).toHaveBeenCalledTimes(1);
+
+        // Next tick still fires at intervalMs (not 2 * intervalMs)
+        jest.advanceTimersByTime(60_000);
+        expect(handler).toHaveBeenCalledTimes(2);
+    });
+
+    // Scenario: in-flight guard. If a tick's emit is still pending (awaitHandlers
+    // case) when the next interval fires, the new tick is skipped — not queued,
+    // not concurrent.
+    it('should skip ticks when prior tick is still in flight (default allowConcurrent=false)', async () => {
+        let resolveHandler;
+        const slowHandler = jest.fn(() => new Promise((r) => { resolveHandler = r; }));
+        bus.on('slow.event', slowHandler);
+        bus.onInterval(1000, 'slow.event', {}, { awaitHandlers: true });
+
+        // Tick 1 starts and hangs
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(slowHandler).toHaveBeenCalledTimes(1);
+
+        // Tick 2 fires while tick 1 is still in flight — skipped by the guard
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(slowHandler).toHaveBeenCalledTimes(1);
+
+        // Resolve tick 1; flush microtasks so inFlight clears
+        resolveHandler();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        // Tick 3 fires normally now that prior is done
+        await jest.advanceTimersByTimeAsync(1000);
+        expect(slowHandler).toHaveBeenCalledTimes(2);
+    });
+
+    // Scenario: allowConcurrent: true disables the in-flight guard.
+    // Useful when ticks are truly independent and overlap is acceptable.
+    it('should allow ticks to overlap when allowConcurrent is true', async () => {
+        const slowHandler = jest.fn(() => new Promise(() => { /* never resolves */ }));
+        bus.on('parallel.event', slowHandler);
+        bus.onInterval(1000, 'parallel.event', {}, {
+            awaitHandlers   : true,
+            allowConcurrent : true,
+        });
+
+        // Each tick fires regardless of whether prior is still in flight
+        jest.advanceTimersByTime(1000);
+        await Promise.resolve();
+        jest.advanceTimersByTime(1000);
+        await Promise.resolve();
+        jest.advanceTimersByTime(1000);
+        await Promise.resolve();
+
+        expect(slowHandler).toHaveBeenCalledTimes(3);
+    });
+
+    // Scenario: awaitHandlers: true routes through emitSync so handler
+    // errors propagate to the tick's catch (and get logged).
+    it('should use emitSync when awaitHandlers is true and log handler errors', async () => {
+        bus.on('flush.metrics', async () => { throw new Error('downstream broke'); });
+        bus.onInterval(1000, 'flush.metrics', {}, { awaitHandlers: true });
+
+        await jest.advanceTimersByTimeAsync(1000);
+
+        expect(console.error).toHaveBeenCalledWith(
+            expect.stringContaining('onInterval tick for "flush.metrics"'),
+            expect.any(Error),
+        );
+    });
+
+    // Scenario: maxRuns auto-cancels the interval after N firings.
+    // Useful for limited campaigns or burn-in periods.
+    it('should auto-offInterval after maxRuns firings', () => {
+        const handler = jest.fn();
+        bus.on('limited.event', handler);
+        const handle = bus.onInterval(100, 'limited.event', {}, { maxRuns: 3 });
+
+        jest.advanceTimersByTime(100);
+        jest.advanceTimersByTime(100);
+        jest.advanceTimersByTime(100);
+        // Three firings; auto-cancelled
+        expect(handler).toHaveBeenCalledTimes(3);
+        expect(bus.intervals.has(handle)).toBe(false);
+
+        // Fourth advance — no tick
+        jest.advanceTimersByTime(100);
+        expect(handler).toHaveBeenCalledTimes(3);
+    });
+
+    // Scenario: offInterval cancels the timer immediately.
+    it('should cancel future ticks when offInterval is called', () => {
+        const handler = jest.fn();
+        bus.on('cancelable.event', handler);
+        const handle = bus.onInterval(1000, 'cancelable.event');
+
+        jest.advanceTimersByTime(1000);
+        expect(handler).toHaveBeenCalledTimes(1);
+
+        expect(bus.offInterval(handle)).toBe(true);
+
+        jest.advanceTimersByTime(5000);
+        expect(handler).toHaveBeenCalledTimes(1);
+    });
+
+    // Scenario: offInterval with an unknown handle is a safe no-op.
+    it('should return false and not throw when offInterval is called with an unknown handle', () => {
+        expect(bus.offInterval(999)).toBe(false);
+        expect(() => bus.offInterval(undefined)).not.toThrow();
+    });
+
+    // Scenario: clear() cancels every active interval.
+    it('should cancel all intervals when clear() is called', () => {
+        const handlerA = jest.fn();
+        const handlerB = jest.fn();
+        bus.on('a.event', handlerA);
+        bus.on('b.event', handlerB);
+        bus.onInterval(1000, 'a.event');
+        bus.onInterval(1000, 'b.event');
+
+        bus.clear();
+
+        jest.advanceTimersByTime(5000);
+        expect(handlerA).not.toHaveBeenCalled();
+        expect(handlerB).not.toHaveBeenCalled();
+        expect(bus.intervals.size).toBe(0);
+    });
+
+    // Scenario: invalid intervalMs is rejected at registration.
+    it('should throw when intervalMs is not a positive finite integer', () => {
+        expect(() => bus.onInterval(0, 'x')).toThrow(/positive finite intervalMs/);
+        expect(() => bus.onInterval(-1, 'x')).toThrow(/positive finite intervalMs/);
+        expect(() => bus.onInterval(Infinity, 'x')).toThrow(/positive finite intervalMs/);
+        expect(() => bus.onInterval(NaN, 'x')).toThrow(/positive finite intervalMs/);
+        expect(() => bus.onInterval('5000', 'x')).toThrow(/positive finite intervalMs/);
+    });
+
+    // Scenario: invalid eventName is rejected at registration.
+    it('should throw when eventName is missing or not a string', () => {
+        expect(() => bus.onInterval(1000)).toThrow(/non-empty string eventName/);
+        expect(() => bus.onInterval(1000, '')).toThrow(/non-empty string eventName/);
+        expect(() => bus.onInterval(1000, 42)).toThrow(/non-empty string eventName/);
+    });
+
+    // Scenario: invalid maxRuns is rejected at registration.
+    it('should throw when maxRuns is not a positive finite integer', () => {
+        expect(() => bus.onInterval(1000, 'x', {}, { maxRuns: 0 })).toThrow(/maxRuns must be a positive finite integer/);
+        expect(() => bus.onInterval(1000, 'x', {}, { maxRuns: -1 })).toThrow(/maxRuns must be a positive finite integer/);
+        expect(() => bus.onInterval(1000, 'x', {}, { maxRuns: Infinity })).toThrow(/maxRuns must be a positive finite integer/);
+    });
+
+    // Scenario: timer is unref()d by default. We verify by spying on the
+    // returned timer's unref method via a wrapper around setInterval.
+    it('should unref() the timer by default', () => {
+        const realSetInterval = global.setInterval;
+        let capturedTimer;
+        global.setInterval = (...args) => {
+            capturedTimer = realSetInterval(...args);
+            capturedTimer.unref = jest.fn(capturedTimer.unref.bind(capturedTimer));
+            return capturedTimer;
+        };
+        try {
+            bus.onInterval(1000, 'x.event');
+            expect(capturedTimer.unref).toHaveBeenCalledTimes(1);
+        }
+        finally {
+            global.setInterval = realSetInterval;
+        }
+    });
+
+    // Scenario: keepAlive: true skips unref() so the timer keeps the
+    // process alive.
+    it('should NOT unref() the timer when keepAlive is true', () => {
+        const realSetInterval = global.setInterval;
+        let capturedTimer;
+        global.setInterval = (...args) => {
+            capturedTimer = realSetInterval(...args);
+            capturedTimer.unref = jest.fn(capturedTimer.unref.bind(capturedTimer));
+            return capturedTimer;
+        };
+        try {
+            bus.onInterval(1000, 'x.event', {}, { keepAlive: true });
+            expect(capturedTimer.unref).not.toHaveBeenCalled();
+        }
+        finally {
+            global.setInterval = realSetInterval;
+        }
+    });
+
+    // Scenario: two independent registrations on the same event produce
+    // two handles and both fire on their own cadence.
+    it('should support multiple independent registrations on the same event', () => {
+        const handler = jest.fn();
+        bus.on('shared.event', handler);
+        const h1 = bus.onInterval(100, 'shared.event');
+        const h2 = bus.onInterval(100, 'shared.event');
+
+        expect(h1).not.toBe(h2);
+
+        jest.advanceTimersByTime(100);
+        // Each registration fires once → 2 emissions → 2 handler calls
+        expect(handler).toHaveBeenCalledTimes(2);
+    });
+});
+
 describe('Event.fromPayload', () => {
 
     // Scenario: fromPayload with null should throw a descriptive error

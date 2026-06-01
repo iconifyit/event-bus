@@ -67,6 +67,26 @@ class EventBus {
          * @private
          */
         this.handlersByEvent = new Map();
+
+        /**
+         * Maps interval handle → metadata for an active onInterval registration.
+         * Each entry holds the underlying NodeJS.Timer, the event name to fire,
+         * the payload, and the per-registration options (allowConcurrent,
+         * awaitHandlers, maxRuns). Handles are monotonic integers issued by
+         * `this._nextHandle`.
+         * @type {Map<number, {timer:NodeJS.Timer, eventName:string, payload:any,
+         *                    options:Object, runCount:number, inFlight:boolean}>}
+         * @private
+         */
+        this.intervals = new Map();
+
+        /**
+         * Monotonic handle generator for scheduled registrations
+         * (onInterval today; CronManager when it lands).
+         * @type {number}
+         * @private
+         */
+        this._nextHandle = 1;
     }
 
     /**
@@ -262,13 +282,153 @@ class EventBus {
     }
 
     /**
-     * Remove all listeners and reset internal state.
+     * Schedule a repeating tick that emits `eventName` every `intervalMs`.
+     *
+     * The first tick fires after `intervalMs` (not at registration) unless
+     * `options.runImmediately === true`. The scheduler emits via `bus.emit`
+     * by default; subscribers receive the event through the usual pub/sub
+     * path with safeRun. Pass `options.awaitHandlers === true` to use
+     * `bus.emitSync` instead — the next tick is then scheduled relative to
+     * handler completion rather than to the previous tick's start.
+     *
+     * Concurrency: if a tick fires while the prior tick is still in flight
+     * (its emit promise hasn't settled), the new tick is skipped by default.
+     * Set `options.allowConcurrent: true` to disable the in-flight guard.
+     *
+     * Lifecycle: the underlying timer is `unref()`d by default so a lone
+     * scheduled task will not keep the Node process alive. Pass
+     * `options.keepAlive: true` to invert this. `offInterval(handle)` cancels;
+     * `clear()` cancels every scheduled task on the bus.
+     *
+     * @param {number} intervalMs            - Tick period in milliseconds. Must be a positive finite integer.
+     * @param {string} eventName             - Event to emit on each tick.
+     * @param {Object} [payload={}]          - Event payload.
+     * @param {Object} [options={}]          - Scheduling options.
+     * @param {boolean} [options.awaitHandlers=false] - Use emitSync (await handlers) instead of emit.
+     * @param {boolean} [options.allowConcurrent=false] - Allow ticks to overlap when prior is still in flight.
+     * @param {number}  [options.maxRuns]    - Auto-offInterval after N tick firings. Default unbounded.
+     * @param {boolean} [options.runImmediately=false] - Fire one tick at registration before the first scheduled tick.
+     * @param {boolean} [options.keepAlive=false] - Do not unref() the timer (keeps Node process alive).
+     * @returns {number} An integer handle suitable for `offInterval`.
+     * @throws {Error} If `intervalMs` is not a positive finite integer or `eventName` is falsy.
+     *
+     * @example
+     * const handle = bus.onInterval(60_000, 'mail.process-queue', { batchSize: 5 });
+     * bus.on('mail.process-queue', (event) => mailService.processQueue(event.getData().batchSize));
+     * // later:
+     * bus.offInterval(handle);
+     *
+     * @example
+     * // Await handlers so the next tick waits for the prior to complete:
+     * bus.onInterval(5000, 'metrics.flush', {}, { awaitHandlers: true });
+     */
+    onInterval(intervalMs, eventName, payload = {}, options = {}) {
+        if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+            throw new Error(
+                `[EventBus] onInterval requires a positive finite intervalMs; got: ${intervalMs}`,
+            );
+        }
+        if (!eventName || typeof eventName !== 'string') {
+            throw new Error('[EventBus] onInterval requires a non-empty string eventName');
+        }
+        if (options.maxRuns !== undefined && (!Number.isFinite(options.maxRuns) || options.maxRuns <= 0)) {
+            throw new Error(
+                `[EventBus] onInterval options.maxRuns must be a positive finite integer when set; got: ${options.maxRuns}`,
+            );
+        }
+
+        const handle = this._nextHandle++;
+
+        const fire = async () => {
+            const entry = this.intervals.get(handle);
+            if (!entry) return;
+            if (entry.inFlight && !entry.options.allowConcurrent) {
+                // Previous tick still running; skip this one.
+                return;
+            }
+            entry.inFlight = true;
+            entry.runCount++;
+            try {
+                if (entry.options.awaitHandlers) {
+                    await this.emitSync(entry.eventName, entry.payload);
+                }
+                else {
+                    this.emit(entry.eventName, entry.payload);
+                }
+            }
+            catch (err) {
+                // emit/emitSync handler errors are normally handled by safeRun;
+                // a top-level throw here only happens when emitSync rejects.
+                // Log so a buggy scheduled handler does not silently rot.
+                console.error(
+                    `[EventBus] onInterval tick for "${entry.eventName}" (handle ${handle}) threw:`,
+                    err,
+                );
+            }
+            finally {
+                entry.inFlight = false;
+                if (entry.options.maxRuns !== undefined && entry.runCount >= entry.options.maxRuns) {
+                    this.offInterval(handle);
+                }
+            }
+        };
+
+        const timer = setInterval(fire, intervalMs);
+        if (!options.keepAlive && typeof timer.unref === 'function') {
+            timer.unref();
+        }
+
+        this.intervals.set(handle, {
+            eventName,
+            inFlight : false,
+            options,
+            payload,
+            runCount : 0,
+            timer,
+        });
+
+        if (options.runImmediately) {
+            // Run on the next microtask so the handle is fully wired before
+            // any handler could call offInterval(handle) reentrantly.
+            Promise.resolve().then(fire);
+        }
+
+        return handle;
+    }
+
+    /**
+     * Cancel a scheduled interval. Safe to call with an unknown / already-
+     * cancelled handle (no-op).
+     *
+     * @param {number} handle - The handle returned by `onInterval`.
+     * @returns {boolean} `true` if a registration was found and cancelled, `false` otherwise.
+     *
+     * @example
+     * const handle = bus.onInterval(60_000, 'mail.poll');
+     * // ...later:
+     * bus.offInterval(handle);
+     */
+    offInterval(handle) {
+        const entry = this.intervals.get(handle);
+        if (!entry) return false;
+        clearInterval(entry.timer);
+        this.intervals.delete(handle);
+        return true;
+    }
+
+    /**
+     * Remove all listeners and reset internal state, including cancelling
+     * every scheduled interval.
      */
     clear() {
         this.adapter.clear();
         this.handlerConfigs  = new WeakMap();
         this.wrappedHandlers = new WeakMap();
         this.handlersByEvent = new Map();
+        for (const entry of this.intervals.values()) {
+            clearInterval(entry.timer);
+        }
+        this.intervals = new Map();
     }
 
     /**
