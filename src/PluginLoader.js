@@ -130,11 +130,24 @@ class PluginLoader {
      * If the plugin defines an `errorHandler`, it is attached to each handler's config
      * so the EventBus `safeRun` can invoke it on errors.
      *
-     * @param {Object|Function} pluginInput - The plugin definition or factory function.
+     * The optional `resolvedPlugin` argument exists so callers that have already
+     * resolved the input (notably `registerAll`) can pass the resolved object
+     * through without paying for a second `resolve()` — which, for factory inputs,
+     * would invoke the factory twice. The original `pluginInput` is still used to
+     * distinguish "factory threw" (specific warning) from "plugin is otherwise
+     * invalid" (generic warning).
+     *
+     * @param {Object|Function} pluginInput      - The plugin definition or factory function.
+     * @param {Object|null}     [resolvedPlugin] - Pre-resolved plugin object, if available.
+     *                                             Pass `null` to indicate a thrown factory.
+     *                                             If `undefined` (default), `register()` resolves
+     *                                             `pluginInput` itself.
      * @returns {boolean} `true` if the plugin was registered, `false` if validation failed.
      */
-    register(pluginInput) {
-        const plugin = this.resolve(pluginInput);
+    register(pluginInput, resolvedPlugin) {
+        const plugin = (resolvedPlugin === undefined)
+            ? this.resolve(pluginInput)
+            : resolvedPlugin;
 
         // Distinguish "factory threw" from "plugin is otherwise invalid":
         // resolve() returns null for both null inputs AND thrown factories.
@@ -190,9 +203,13 @@ class PluginLoader {
         const skipped    = [];
 
         for (const pluginInput of plugins) {
-            // Resolve before registration so we can report the name accurately
+            // Resolve once here so we can report the name accurately, and
+            // pass the resolved plugin through to register() so it does NOT
+            // invoke the factory a second time. The original pluginInput is
+            // also passed so register() can still emit the specific
+            // "factory function threw" warning when applicable.
             const plugin  = this.resolve(pluginInput);
-            const success = this.register(plugin);
+            const success = this.register(pluginInput, plugin);
             if (success) {
                 registered.push(plugin.name);
             }

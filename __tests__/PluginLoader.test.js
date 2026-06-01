@@ -381,6 +381,45 @@ describe('PluginLoader', () => {
             expect(summary.skipped).toHaveLength(1);
             expect(loader.isRegistered('good-plugin')).toBe(true);
         });
+
+        // Scenario: registerAll must NOT invoke a factory twice (registerAll
+        // resolves once and passes the resolved object to register, which
+        // would otherwise resolve again). Double-invocation matters because
+        // real-world factories may consume context, allocate resources, or
+        // have observable side effects on construction.
+        it('should invoke each plugin factory exactly once via registerAll', () => {
+            const factory = jest.fn(() => ({
+                name   : 'one-shot-plugin',
+                events : [{ type : 'verify.once', handler : jest.fn() }],
+            }));
+
+            const summary = loader.registerAll([factory]);
+
+            expect(factory).toHaveBeenCalledTimes(1);
+            expect(summary.registered).toEqual(['one-shot-plugin']);
+        });
+
+        // Scenario: registerAll must still surface the specific "factory
+        // function threw" warning (rather than the generic "Plugin must be
+        // a non-null object") when a factory throws. The pre-resolve-then-pass
+        // pattern would lose the function-type information from register()
+        // without the resolvedPlugin pass-through.
+        it('should emit the specific "factory threw" warning via registerAll', () => {
+            jest.spyOn(console, 'warn').mockImplementation(() => {});
+            const throwingFactory = () => {
+                throw new Error('boom');
+            };
+
+            loader.registerAll([throwingFactory]);
+
+            expect(console.warn).toHaveBeenCalledWith(
+                expect.stringContaining('Skipping plugin: factory function threw during resolution'),
+            );
+            expect(console.warn).not.toHaveBeenCalledWith(
+                expect.stringContaining('Plugin must be a non-null object'),
+                expect.anything(),
+            );
+        });
     });
 
     describe('errorHandler config injection', () => {
