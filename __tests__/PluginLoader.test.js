@@ -405,7 +405,8 @@ describe('PluginLoader', () => {
         // pattern would lose the function-type information from register()
         // without the resolvedPlugin pass-through.
         it('should emit the specific "factory threw" warning via registerAll', () => {
-            jest.spyOn(console, 'warn').mockImplementation(() => {});
+            // console.warn is already spied in the suite-level beforeEach;
+            // no need to re-install it here.
             const throwingFactory = () => {
                 throw new Error('boom');
             };
