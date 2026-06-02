@@ -12,6 +12,7 @@
  *     registerEventType,
  *     registerEventTypes,
  *     PluginLoader,
+ *     BaseNotifier,
  * } = require('@vectoricons.net/event-bus');
  *
  * // 1. Define your event types
@@ -20,27 +21,36 @@
  *     USER_LOGIN  : 'user.login',
  * });
  *
- * // 2. Initialize the bus (singleton)
+ * // 2. (Optional) Define notifiers by subclassing BaseNotifier
+ * class MySlackNotifier extends BaseNotifier {
+ *     async notify(subject, error) {
+ *         await slack.send('#errors', `${subject}: ${error.message}`);
+ *     }
+ * }
+ *
+ * // 3. Initialize the bus (singleton) with notifiers
  * const bus = initEventBus({
  *     notifiers: {
- *         slack: mySlackNotifier,  // implements BaseNotifier
+ *         slack : new MySlackNotifier(),
  *     },
  * });
  *
- * // 3. Register plugins
- * const loader = new PluginLoader(bus);
+ * // 4. Register plugins. Handlers can opt into notifier dispatch via config:
+ * //    bus.on('user.signup', handler, { onError: { notify: ['slack'] } });
+ * const loader = new PluginLoader({ eventBus: bus });
  * loader.register(require('./plugins/welcome-email'));
  *
- * // 4. Emit events
+ * // 5. Emit events
  * bus.emit(EventTypes.USER_SIGNUP, { userId: 42, email: 'user@example.com' });
  * ```
  */
-const EventBus          = require('./src/EventBus');
-const Event             = require('./src/Event');
-const PluginLoader      = require('./src/PluginLoader');
-const MemoryAdapter     = require('./src/adapters/MemoryAdapter');
+const EventBus            = require('./src/EventBus');
+const Event               = require('./src/Event');
+const WriteEmitter        = require('./src/WriteEmitter');
+const PluginLoader        = require('./src/PluginLoader');
+const MemoryAdapter       = require('./src/adapters/MemoryAdapter');
 const BaseEventBusAdapter = require('./src/adapters/BaseEventBusAdapter');
-const BaseNotifier      = require('./src/notifiers/BaseNotifier');
+const BaseNotifier        = require('./src/notifiers/BaseNotifier');
 
 const {
     EventTypes,
@@ -59,7 +69,9 @@ let singleton = null;
  * @param {import('./src/adapters/BaseEventBusAdapter')} [options.adapter]
  *   Adapter instance. Defaults to a new MemoryAdapter.
  * @param {Object<string, import('./src/notifiers/BaseNotifier')>} [options.notifiers={}]
- *   Named notifier instances for error handling.
+ *   Named notifier instances. Each must implement BaseNotifier (i.e. have an
+ *   async `notify(subject, error)` method). Handlers opt into dispatch via
+ *   `config.onError.notify: ['notifierName', ...]` when registered.
  * @returns {EventBus} The singleton EventBus instance.
  *
  * @example
@@ -109,6 +121,7 @@ module.exports = {
     registerEventType,
     registerEventTypes,
     getEventTypes,
+    WriteEmitter,
     PluginLoader,
     MemoryAdapter,
     BaseEventBusAdapter,

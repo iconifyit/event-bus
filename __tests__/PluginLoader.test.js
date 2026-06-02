@@ -2,7 +2,8 @@
  * PluginLoader tests.
  *
  * Tests cover: valid plugin registration, duplicate rejection,
- * invalid plugin validation, once-handlers, and registerAll().
+ * invalid plugin validation, once-handlers, registerAll(),
+ * factory function support, context injection, and errorHandler config.
  */
 const {
     initEventBus,
@@ -114,6 +115,34 @@ describe('PluginLoader', () => {
         expect(loader.register(42)).toBe(false);
     });
 
+    // Scenario: eventDef.config must be a plain object. A string, number,
+    // null, or array would silently coerce under object-spread inside
+    // register() (e.g. spreading an array yields indexed keys), which
+    // can pollute the handler's config with surprising entries and
+    // mask plugin definition typos. Validate up-front.
+    it('should reject events with a non-plain-object "config"', () => {
+        const make = (config) => ({
+            name   : 'bad-config',
+            events : [{ type : 'test.event', handler : jest.fn(), config }],
+        });
+
+        expect(loader.register(make('string-config'))).toBe(false);
+        expect(loader.register(make(42))).toBe(false);
+        expect(loader.register(make(null))).toBe(false);
+        expect(loader.register(make(['onError', 'notify']))).toBe(false);
+        expect(loader.register(make(true))).toBe(false);
+    });
+
+    // Scenario: omitting eventDef.config entirely is valid (it's optional).
+    it('should accept events with no "config" property', () => {
+        const plugin = {
+            name   : 'no-config',
+            events : [{ type : 'test.event', handler : jest.fn() }],
+        };
+
+        expect(loader.register(plugin)).toBe(true);
+    });
+
     // Scenario: A plugin with once: true should fire its handler only on the first emit
     it('should support once handlers via the once flag', async () => {
         const handler = jest.fn();
@@ -178,5 +207,353 @@ describe('PluginLoader', () => {
                 expect.stringContaining('events[0] must be a non-null object'),
             ]),
         );
+    });
+
+    describe('constructor options API', () => {
+
+        // Scenario: PluginLoader accepts the new { eventBus, context } options shape
+        it('should accept an options object with eventBus and context', () => {
+            const contextLoader = new PluginLoader({ eventBus : bus, context : { foo : 'bar' } });
+            expect(contextLoader).toBeInstanceOf(PluginLoader);
+        });
+
+        // Scenario: PluginLoader accepts the new options shape without context
+        it('should default context to empty object when omitted', () => {
+            const contextLoader = new PluginLoader({ eventBus : bus });
+            expect(contextLoader).toBeInstanceOf(PluginLoader);
+        });
+
+        // Scenario: PluginLoader still throws when no eventBus is provided
+        it('should throw when constructed without an eventBus', () => {
+            expect(() => new PluginLoader({})).toThrow('PluginLoader requires an EventBus instance');
+            expect(() => new PluginLoader()).toThrow('PluginLoader requires an EventBus instance');
+            expect(() => new PluginLoader(null)).toThrow('PluginLoader requires an EventBus instance');
+        });
+    });
+
+    describe('factory function support', () => {
+
+        // Scenario: A factory function plugin receives context and registers correctly
+        it('should resolve a factory function and register the returned plugin', async () => {
+            const handler = jest.fn();
+            const factory = (context) => ({
+                name   : 'factory-mailer',
+                events : [{
+                    type    : 'mail.send',
+                    handler,
+                }],
+            });
+
+            const contextLoader = new PluginLoader({
+                eventBus : bus,
+                context  : { mailService : { send : jest.fn() } },
+            });
+
+            expect(contextLoader.register(factory)).toBe(true);
+            expect(contextLoader.isRegistered('factory-mailer')).toBe(true);
+
+            bus.emit('mail.send', { to : 'admin@vectoricons.net' });
+            await tick();
+
+            expect(handler).toHaveBeenCalledTimes(1);
+        });
+
+        // Scenario: Factory receives the exact context object from the constructor
+        it('should pass the context to factory functions', () => {
+            const receivedContext = [];
+            const factory = (context) => {
+                receivedContext.push(context);
+                return {
+                    name   : 'context-checker',
+                    events : [{ type : 'test.event', handler : jest.fn() }],
+                };
+            };
+
+            const appContext = { templateService : {}, mailService : {} };
+            const contextLoader = new PluginLoader({ eventBus : bus, context : appContext });
+            contextLoader.register(factory);
+
+            expect(receivedContext).toHaveLength(1);
+            expect(receivedContext[0]).toBe(appContext);
+        });
+
+        // Scenario: A factory that returns an invalid plugin should be rejected
+        it('should reject a factory that returns an invalid plugin', () => {
+            const factory = () => ({ name : 'bad-factory', events : [] });
+
+            const contextLoader = new PluginLoader({ eventBus : bus });
+            expect(contextLoader.register(factory)).toBe(false);
+        });
+
+        // Scenario: registerAll should work with a mix of factories and plain objects
+        it('should handle mixed factories and plain objects in registerAll', async () => {
+            const handlerA = jest.fn();
+            const handlerB = jest.fn();
+
+            const plainPlugin = {
+                name   : 'plain-plugin',
+                events : [{ type : 'event.a', handler : handlerA }],
+            };
+
+            const factory = (context) => ({
+                name   : 'factory-plugin',
+                events : [{ type : 'event.b', handler : handlerB }],
+            });
+
+            const contextLoader = new PluginLoader({ eventBus : bus, context : {} });
+            const result = contextLoader.registerAll([plainPlugin, factory]);
+
+            expect(result.registered).toEqual(['plain-plugin', 'factory-plugin']);
+            expect(result.skipped).toEqual([]);
+
+            bus.emit('event.a', {});
+            bus.emit('event.b', {});
+            await tick();
+
+            expect(handlerA).toHaveBeenCalledTimes(1);
+            expect(handlerB).toHaveBeenCalledTimes(1);
+        });
+
+        // Scenario: Factory function uses context.emitter to emit events
+        it('should allow factory plugins to use context.emitter', async () => {
+            const { WriteEmitter } = require('../index');
+            const emitter = bus.createEmitter();
+            const receivedEvents = [];
+
+            // Delivery handler that will receive the emitted event
+            bus.on('mail.send', async (event) => {
+                receivedEvents.push(event.getData());
+            });
+
+            // Orchestration factory that emits via context.emitter
+            const orchestrationFactory = (context) => ({
+                name   : 'signup-orchestrator',
+                events : [{
+                    type    : 'user.signup',
+                    handler : async (event) => {
+                        const { email } = event.getData();
+                        context.emitter.emit('mail.send', {
+                            to       : email,
+                            subject  : 'Welcome!',
+                            template : 'welcome-offer',
+                        });
+                    },
+                }],
+            });
+
+            const contextLoader = new PluginLoader({
+                eventBus : bus,
+                context  : { emitter },
+            });
+            contextLoader.register(orchestrationFactory);
+
+            bus.emit('user.signup', { email : 'jane@vectoricons.net', username : 'janedoe' });
+            await tick();
+
+            expect(receivedEvents).toHaveLength(1);
+            expect(receivedEvents[0]).toEqual({
+                to       : 'jane@vectoricons.net',
+                subject  : 'Welcome!',
+                template : 'welcome-offer',
+            });
+        });
+
+        // Scenario: a factory function that throws during invocation. The
+        // module header guarantees invalid plugins are skipped without
+        // crashing the app, so resolve() catches and logs, register() then
+        // sees null and reports it as an invalid plugin.
+        // Uses the console.warn spy installed in the suite-level beforeEach.
+        it('should catch factory exceptions and skip the plugin without crashing', () => {
+            const throwingFactory = () => {
+                throw new Error('factory blew up');
+            };
+
+            const result = loader.register(throwingFactory);
+
+            expect(result).toBe(false);
+            // resolve() logs the underlying error
+            expect(console.warn).toHaveBeenCalledWith(
+                expect.stringContaining('Plugin factory threw during resolution; skipping plugin:'),
+                expect.any(Error),
+            );
+            // register() emits the specific "factory function threw" skip
+            // message rather than the generic "Plugin must be a non-null
+            // object" message. Two separate warn calls.
+            expect(console.warn).toHaveBeenCalledWith(
+                expect.stringContaining('Skipping plugin: factory function threw during resolution'),
+            );
+            // Ensure the generic-object message did NOT also fire.
+            expect(console.warn).not.toHaveBeenCalledWith(
+                expect.stringContaining('Plugin must be a non-null object'),
+                expect.anything(),
+            );
+        });
+
+        // Scenario: when registerAll encounters a throwing factory in the
+        // middle of a batch, the rest of the batch still registers cleanly.
+        // resolve() returns null for the broken factory; register() rejects
+        // it; the next iteration continues.
+        it('should continue processing other plugins when one factory throws', () => {
+            const goodHandler = jest.fn();
+            const goodFactory = () => ({
+                name   : 'good-plugin',
+                events : [{ type : 'ok.event', handler : goodHandler }],
+            });
+            const throwingFactory = () => {
+                throw new Error('factory blew up');
+            };
+
+            const summary = loader.registerAll([goodFactory, throwingFactory]);
+
+            expect(summary.registered).toEqual(['good-plugin']);
+            expect(summary.skipped).toHaveLength(1);
+            expect(loader.isRegistered('good-plugin')).toBe(true);
+        });
+
+        // Scenario: registerAll must NOT invoke a factory twice (registerAll
+        // resolves once and passes the resolved object to register, which
+        // would otherwise resolve again). Double-invocation matters because
+        // real-world factories may consume context, allocate resources, or
+        // have observable side effects on construction.
+        it('should invoke each plugin factory exactly once via registerAll', () => {
+            const factory = jest.fn(() => ({
+                name   : 'one-shot-plugin',
+                events : [{ type : 'verify.once', handler : jest.fn() }],
+            }));
+
+            const summary = loader.registerAll([factory]);
+
+            expect(factory).toHaveBeenCalledTimes(1);
+            expect(summary.registered).toEqual(['one-shot-plugin']);
+        });
+
+        // Scenario: registerAll must still surface the specific "factory
+        // function threw" warning (rather than the generic "Plugin must be
+        // a non-null object") when a factory throws. The pre-resolve-then-pass
+        // pattern would lose the function-type information from register()
+        // without the resolvedPlugin pass-through.
+        it('should emit the specific "factory threw" warning via registerAll', () => {
+            // console.warn is already spied in the suite-level beforeEach;
+            // no need to re-install it here.
+            const throwingFactory = () => {
+                throw new Error('boom');
+            };
+
+            loader.registerAll([throwingFactory]);
+
+            expect(console.warn).toHaveBeenCalledWith(
+                expect.stringContaining('Skipping plugin: factory function threw during resolution'),
+            );
+            expect(console.warn).not.toHaveBeenCalledWith(
+                expect.stringContaining('Plugin must be a non-null object'),
+                expect.anything(),
+            );
+        });
+    });
+
+    describe('errorHandler config injection', () => {
+
+        // Scenario: A plugin with errorHandler gets it passed as config to bus.on()
+        it('should attach errorHandler to handler config when plugin defines one', () => {
+            const onSpy = jest.spyOn(bus, 'on');
+            const errorHandler = (error, event) => error;
+            const handler = jest.fn();
+
+            const plugin = {
+                name         : 'plugin-with-error-handler',
+                errorHandler,
+                events       : [{ type : 'test.event', handler }],
+            };
+
+            const contextLoader = new PluginLoader({ eventBus : bus });
+            contextLoader.register(plugin);
+
+            expect(onSpy).toHaveBeenCalledWith(
+                'test.event',
+                handler,
+                expect.objectContaining({
+                    pluginName   : 'plugin-with-error-handler',
+                    errorHandler,
+                }),
+            );
+
+            onSpy.mockRestore();
+        });
+
+        // Scenario: A plugin without errorHandler should not inject one into config
+        it('should not inject errorHandler when plugin does not define one', () => {
+            const onSpy = jest.spyOn(bus, 'on');
+            const handler = jest.fn();
+
+            const plugin = {
+                name   : 'no-error-handler-plugin',
+                events : [{ type : 'test.event', handler }],
+            };
+
+            const contextLoader = new PluginLoader({ eventBus : bus });
+            contextLoader.register(plugin);
+
+            const passedConfig = onSpy.mock.calls[0][2];
+            expect(passedConfig.pluginName).toBe('no-error-handler-plugin');
+            expect(passedConfig.errorHandler).toBeUndefined();
+
+            onSpy.mockRestore();
+        });
+
+        // Scenario: Plugin-level config is preserved and merged with pluginName/errorHandler
+        it('should merge plugin-level config with event-level config', () => {
+            const onSpy = jest.spyOn(bus, 'on');
+            const errorHandler = jest.fn();
+            const handler = jest.fn();
+
+            const plugin = {
+                name         : 'merged-config-plugin',
+                errorHandler,
+                events       : [{
+                    type    : 'test.event',
+                    handler,
+                    config  : { onError : { notify : ['slack'] } },
+                }],
+            };
+
+            const contextLoader = new PluginLoader({ eventBus : bus });
+            contextLoader.register(plugin);
+
+            const passedConfig = onSpy.mock.calls[0][2];
+            expect(passedConfig).toEqual({
+                onError      : { notify : ['slack'] },
+                pluginName   : 'merged-config-plugin',
+                errorHandler,
+            });
+
+            onSpy.mockRestore();
+        });
+
+        // Scenario: Factory function plugin with errorHandler
+        it('should support errorHandler on factory function plugins', () => {
+            const onSpy = jest.spyOn(bus, 'on');
+            const errorHandler = (error, event) => error;
+            const handler = jest.fn();
+
+            const factory = (context) => ({
+                name         : 'factory-error-handler',
+                errorHandler,
+                events       : [{ type : 'mail.send', handler }],
+            });
+
+            const contextLoader = new PluginLoader({ eventBus : bus, context : {} });
+            contextLoader.register(factory);
+
+            expect(onSpy).toHaveBeenCalledWith(
+                'mail.send',
+                handler,
+                expect.objectContaining({
+                    pluginName   : 'factory-error-handler',
+                    errorHandler,
+                }),
+            );
+
+            onSpy.mockRestore();
+        });
     });
 });

@@ -137,3 +137,14 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+.DS_Store
+# sync-agents — ignore tool artifacts, keep symlinks
+.cursor/*
+!.cursor/rules
+.codex/*
+!.codex/instructions.md
+.github/copilot/*
+!.github/copilot/instructions.md
+
+# Local agent docs (kept on disk, not committed)
+AGENTS.md
