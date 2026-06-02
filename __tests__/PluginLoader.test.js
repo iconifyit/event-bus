@@ -115,6 +115,34 @@ describe('PluginLoader', () => {
         expect(loader.register(42)).toBe(false);
     });
 
+    // Scenario: eventDef.config must be a plain object. A string, number,
+    // null, or array would silently coerce under object-spread inside
+    // register() (e.g. spreading an array yields indexed keys), which
+    // can pollute the handler's config with surprising entries and
+    // mask plugin definition typos. Validate up-front.
+    it('should reject events with a non-plain-object "config"', () => {
+        const make = (config) => ({
+            name   : 'bad-config',
+            events : [{ type : 'test.event', handler : jest.fn(), config }],
+        });
+
+        expect(loader.register(make('string-config'))).toBe(false);
+        expect(loader.register(make(42))).toBe(false);
+        expect(loader.register(make(null))).toBe(false);
+        expect(loader.register(make(['onError', 'notify']))).toBe(false);
+        expect(loader.register(make(true))).toBe(false);
+    });
+
+    // Scenario: omitting eventDef.config entirely is valid (it's optional).
+    it('should accept events with no "config" property', () => {
+        const plugin = {
+            name   : 'no-config',
+            events : [{ type : 'test.event', handler : jest.fn() }],
+        };
+
+        expect(loader.register(plugin)).toBe(true);
+    });
+
     // Scenario: A plugin with once: true should fire its handler only on the first emit
     it('should support once handlers via the once flag', async () => {
         const handler = jest.fn();

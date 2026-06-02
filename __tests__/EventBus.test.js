@@ -314,6 +314,41 @@ describe('EventBus', () => {
         expect(handler).toHaveBeenCalledTimes(1);
     });
 
+    // Scenario: a once() handler that throws still routes through its
+    // plugin's `errorHandler` and `pluginName` is reported correctly.
+    //
+    // Regression test: once()'s wrapper removes the handler from the
+    // adapter SYNCHRONOUSLY before safeRun runs, which also clears the
+    // handler's config from handlerConfigs. Without capturing the config
+    // up-front and passing it through to safeRun, the once-handler would
+    // throw, safeRun would look up an empty config, fall back to
+    // pluginName="unknown", and skip the plugin's errorHandler entirely —
+    // silently losing both tiers of error handling for once-handlers.
+    it('should preserve pluginName and errorHandler for a throwing once-handler', async () => {
+        const handler = () => { throw new Error('once-handler exploded'); };
+        const errorHandler = jest.fn(() => undefined); // swallow
+
+        bus.once('one-shot.with-config', handler, {
+            errorHandler,
+            pluginName : 'queue-worker-plugin',
+        });
+
+        bus.emit('one-shot.with-config', { id: 1 });
+        await tick();
+
+        // The plugin's errorHandler was invoked — proving safeRun saw
+        // the captured config rather than the wiped-out lookup.
+        expect(errorHandler).toHaveBeenCalledTimes(1);
+        expect(errorHandler.mock.calls[0][0].message).toBe('once-handler exploded');
+
+        // The console.error (mocked in suite beforeEach) logged the
+        // correct plugin name (not "unknown").
+        expect(console.error).toHaveBeenCalledWith(
+            expect.stringContaining('plugin: queue-worker-plugin'),
+            expect.any(Error),
+        );
+    });
+
     // Scenario: an async errorHandler returns a Promise. Without awaiting,
     // the returned Promise is not an Error and the swallow branch wrongly
     // fires. With await, the resolved Error is treated correctly.

@@ -39,7 +39,20 @@ class WriteEmitter {
         if (typeof emitFn !== 'function') {
             throw new Error('WriteEmitter requires an emit function');
         }
-        this._emit = emitFn;
+        // Define `_emit` as non-enumerable, non-writable, and
+        // non-configurable so consumers and plugins cannot discover and
+        // call it directly via `Object.keys(emitter)`, `{ ...emitter }`,
+        // or reassign it to substitute a different sink. The whole point
+        // of WriteEmitter is to expose `emit()` and nothing else; a
+        // plain `this._emit = emitFn` made `_emit` enumerable and
+        // publicly assignable, defeating the "single emit() method"
+        // intent.
+        Object.defineProperty(this, '_emit', {
+            value        : emitFn,
+            writable     : false,
+            enumerable   : false,
+            configurable : false,
+        });
     }
 
     /**

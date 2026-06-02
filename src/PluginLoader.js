@@ -253,6 +253,19 @@ class PluginLoader {
                 if (typeof eventDef.handler !== 'function') {
                     errors.push(`events[${index}] must have a "handler" function`);
                 }
+                // `config` is spread into the per-handler config object in
+                // register(); a non-object value (string/number/array) would
+                // coerce silently under spread and pollute the resulting
+                // config in surprising ways (e.g. an array spreads its
+                // indexed entries as keys). Reject anything that isn't a
+                // plain object or undefined. `null` is also rejected because
+                // `{...null}` works but null almost certainly indicates a
+                // typo in the plugin definition.
+                if (eventDef.config !== undefined && (eventDef.config === null
+                    || typeof eventDef.config !== 'object'
+                    || Array.isArray(eventDef.config))) {
+                    errors.push(`events[${index}] "config" must be a plain object when provided`);
+                }
             });
         }
 

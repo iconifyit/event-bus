@@ -250,11 +250,21 @@ class EventBus {
         // got a chance to call off(). Removing up-front cuts the adapter
         // listener before control returns to the synchronous caller, so
         // a second synchronous emit fires nothing.
+        // Capture the resolved config BEFORE removing the registration.
+        // `this.off(event, handler)` wipes `handlerConfigs[handler][event]`,
+        // so any later lookup inside `safeRun` would return an empty
+        // config — meaning `pluginName` would fall back to "unknown" and
+        // any configured `errorHandler` / `onError.notify` would be
+        // silently dropped for once-handlers. We pass the captured config
+        // to `safeRun` so the error path still sees the plugin's
+        // configuration even though the registration is already gone.
+        const presetConfig = { ...config };
+
         const wrapped = async (payload) => {
             // Idempotent: if a concurrent path (e.g. emitSync cleanup)
             // already removed the registration, off() short-circuits.
             this.off(event, handler);
-            await this.safeRun(event, handler, payload);
+            await this.safeRun(event, handler, payload, presetConfig);
         };
 
         if (!this.handlerConfigs.has(handler)) {
@@ -599,19 +609,31 @@ class EventBus {
      * dispatch is fire-and-forget — promises are not awaited and notifier
      * errors are logged but do not affect the rest of the error chain.
      *
-     * @param {string} eventName - The event name (for error context).
-     * @param {Function} handler - The original handler function.
-     * @param {*} payload - The Event payload passed to the handler.
+     * @param {string} eventName    - The event name (for error context).
+     * @param {Function} handler    - The original handler function.
+     * @param {*} payload           - The Event payload passed to the handler.
+     * @param {Object} [presetConfig] - Optional pre-resolved config. Used by
+     *                                  `once()`'s wrapper, which must remove
+     *                                  the handler from the adapter
+     *                                  synchronously (which also wipes
+     *                                  `handlerConfigs`) BEFORE the handler
+     *                                  runs. Passing the captured config in
+     *                                  ensures the error path can still see
+     *                                  `pluginName`, `errorHandler`, and
+     *                                  `onError.notify` for once-handlers.
      * @private
      */
-    async safeRun(eventName, handler, payload) {
+    async safeRun(eventName, handler, payload, presetConfig) {
         try {
             await handler(payload);
         }
         catch (error) {
             // Step 1: console.error always fires (non-negotiable safety net)
-            const configMap  = this.handlerConfigs.get(handler);
-            const config     = (configMap && configMap.get(eventName)) || {};
+            let config = presetConfig;
+            if (!config) {
+                const configMap = this.handlerConfigs.get(handler);
+                config = (configMap && configMap.get(eventName)) || {};
+            }
             const pluginName = config.pluginName || 'unknown';
 
             console.error(`[EventBus] Error in handler for "${eventName}" (plugin: ${pluginName}):`, error);

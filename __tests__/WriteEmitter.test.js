@@ -97,6 +97,45 @@ describe('WriteEmitter', () => {
             // _emit is a function and won't serialize — the object should be empty or minimal
             expect(parsed._emit).toBeUndefined();
         });
+
+        // Scenario: `_emit` is defined as non-enumerable, non-writable,
+        // non-configurable. Consumers cannot discover it via
+        // `Object.keys(emitter)` or `{ ...emitter }`, cannot overwrite
+        // it to substitute a different sink, and cannot delete it.
+        // Without `Object.defineProperty`, a plain `this._emit = fn`
+        // assignment makes the property publicly enumerable and
+        // writable, defeating the "single emit() method" intent.
+        it('should hide _emit from Object.keys and object-spread', () => {
+            const emitter = new WriteEmitter(jest.fn());
+
+            expect(Object.keys(emitter)).not.toContain('_emit');
+            expect(Object.keys({ ...emitter })).not.toContain('_emit');
+
+            const descriptor = Object.getOwnPropertyDescriptor(emitter, '_emit');
+            expect(descriptor.enumerable).toBe(false);
+            expect(descriptor.writable).toBe(false);
+            expect(descriptor.configurable).toBe(false);
+        });
+
+        // Scenario: attempting to reassign or delete _emit fails silently
+        // in non-strict mode and throws in strict mode. Either way the
+        // original emit function MUST still be invoked by emit().
+        it('should not allow consumers to overwrite the internal emit function', () => {
+            const realEmit = jest.fn().mockReturnValue(true);
+            const fakeEmit = jest.fn();
+            const emitter = new WriteEmitter(realEmit);
+
+            // Reassignment is either silently ignored (sloppy) or throws
+            // (strict). Either is acceptable — the property must stay
+            // bound to the original function.
+            try { emitter._emit = fakeEmit; }
+            catch (_) { /* TypeError in strict mode is fine */ }
+
+            emitter.emit('test.event', { a: 1 });
+
+            expect(realEmit).toHaveBeenCalledTimes(1);
+            expect(fakeEmit).not.toHaveBeenCalled();
+        });
     });
 
     describe('EventBus.createEmitter() integration', () => {
