@@ -273,6 +273,47 @@ describe('EventBus', () => {
         expect(handler).toHaveBeenCalledTimes(1);
     });
 
+    // Scenario: a once() registration is cancelled via bus.off() BEFORE
+    // any emit. The handler must NOT fire. This regressed when once()
+    // registered its wrapper via adapter.once(): the adapter's once
+    // implementation wrapped the wrapper in yet another closure and
+    // registered THAT with the underlying emitter, so bus.off() called
+    // adapter.off(event, wrapped) and removed nothing — the adapter
+    // listener stayed live and the handler fired on the next emit.
+    // once() now registers via adapter.on(wrapped), so adapter.off()
+    // targets the function the adapter is actually tracking.
+    it('should cancel a once() registration via bus.off() before any emit', async () => {
+        const handler = jest.fn();
+        bus.once('cancellable.once', handler);
+
+        bus.off('cancellable.once', handler);
+
+        bus.emit('cancellable.once', { ignored: true });
+        await tick();
+
+        expect(handler).not.toHaveBeenCalled();
+    });
+
+    // Scenario: a once() handler is fired via emitSync(), THEN a
+    // subsequent emit() arrives. The handler must NOT fire a second
+    // time. This regressed under the prior adapter.once() registration:
+    // emitSync called the raw handler directly and cleared the bus's
+    // bookkeeping, but the adapter listener stayed because adapter.off()
+    // could not find the wrapper. A later emit() then re-fired the
+    // handler, violating once-semantics across the emit/emitSync mix.
+    it('should not re-fire a once() handler when emit() follows emitSync()', async () => {
+        const handler = jest.fn();
+        bus.once('mixed.once', handler);
+
+        await bus.emitSync('mixed.once', { viaEmitSync: true });
+        expect(handler).toHaveBeenCalledTimes(1);
+
+        bus.emit('mixed.once', { viaEmit: true });
+        await tick();
+
+        expect(handler).toHaveBeenCalledTimes(1);
+    });
+
     // Scenario: an async errorHandler returns a Promise. Without awaiting,
     // the returned Promise is not an Error and the swallow branch wrongly
     // fires. With await, the resolved Error is treated correctly.

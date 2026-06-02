@@ -70,11 +70,14 @@ class EventBus {
 
         /**
          * Maps event name → Set of handlers registered via once().
-         * After emitSync() invokes a one-shot handler, it consults this
-         * index to remove the handler from all bookkeeping. The adapter
-         * (mitt) handles its own once-removal on the emit() path, but
-         * emitSync calls the raw handler directly, so it needs an
-         * independent record of which handlers are one-shot.
+         * Both emit() and emitSync() consult this index to drive
+         * one-shot semantics: on the emit() path the wrapper's own
+         * finally block calls this.off(event, handler); on the emitSync()
+         * path the dispatcher calls this.off(event, handler) for any
+         * snapshot entry that is in this set. once() registers its
+         * wrapper via adapter.on() (not adapter.once()) so that
+         * adapter.off() targets the same function the adapter is
+         * tracking.
          * @type {Map<string, Set<Function>>}
          * @private
          */
@@ -225,18 +228,33 @@ class EventBus {
             return;
         }
 
-        // The adapter removes the wrapped function after the first fire,
-        // but we also need to clean our internal indexes so emitSync
-        // does not re-invoke the original handler and so we do not leak
-        // references over time. Cleanup runs in finally so it happens
-        // even if the handler throws.
+        // Register via adapter.on() (NOT adapter.once()), and remove
+        // the registration SYNCHRONOUSLY at the start of `wrapped`
+        // before the async safeRun begins.
+        //
+        // Why not adapter.once()? Adapter implementations typically wrap
+        // the provided handler in their own closure and register THAT
+        // closure with the underlying emitter — so a later
+        // adapter.off(event, wrapped) call targets a function the
+        // adapter never registered, and the listener silently stays.
+        // That broke cancellation (bus.off before any emit did nothing)
+        // and once-semantics across mixed emit + emitSync sequences (the
+        // adapter listener survived emitSync's bookkeeping cleanup and
+        // re-fired on a subsequent emit).
+        //
+        // Why remove synchronously at the start, not in finally? safeRun
+        // is async — its returned Promise pends through one or more
+        // microtasks. A burst of synchronous emits (`bus.emit(); bus.emit();`)
+        // would all observe `wrapped` still registered with the adapter
+        // and queue handler invocations before the finally block ever
+        // got a chance to call off(). Removing up-front cuts the adapter
+        // listener before control returns to the synchronous caller, so
+        // a second synchronous emit fires nothing.
         const wrapped = async (payload) => {
-            try {
-                await this.safeRun(event, handler, payload);
-            }
-            finally {
-                this.off(event, handler);
-            }
+            // Idempotent: if a concurrent path (e.g. emitSync cleanup)
+            // already removed the registration, off() short-circuits.
+            this.off(event, handler);
+            await this.safeRun(event, handler, payload);
         };
 
         if (!this.handlerConfigs.has(handler)) {
@@ -256,7 +274,7 @@ class EventBus {
         this.wrappedHandlers.get(handler).set(event, wrapped);
         this.handlersByEvent.get(event).add(handler);
         this.onceHandlers.get(event).add(handler);
-        this.adapter.once(event, wrapped);
+        this.adapter.on(event, wrapped);
     }
 
     /**
