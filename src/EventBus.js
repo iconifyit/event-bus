@@ -559,6 +559,14 @@ class EventBus {
             clearInterval(entry.timer);
         }
         this.intervals = new Map();
+        // Reset the handle counter alongside every other piece of state so
+        // a fully cleared bus behaves like a freshly-constructed one.
+        // Without this, handles keep growing across clear() calls — fine
+        // in production (Number.MAX_SAFE_INTEGER is plenty) but it makes
+        // tests that recreate the bus per case non-deterministic in their
+        // handle values, and accumulates unbounded growth in long-running
+        // processes that recreate the bus often.
+        this._nextHandle = 1;
     }
 
     /**

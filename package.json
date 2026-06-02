@@ -1,6 +1,6 @@
 {
     "name": "@vectoricons.net/event-bus",
-    "version": "1.4.5",
+    "version": "1.4.6",
     "description": "A lightweight, adapter-based EventBus for Node.js with immutable event objects, a plugin registration system, and two-tier error handling.",
     "main": "index.js",
     "scripts": {

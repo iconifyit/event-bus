@@ -195,6 +195,25 @@ describe('EventBus', () => {
         expect(handler).not.toHaveBeenCalled();
     });
 
+    // Scenario: clear() resets `_nextHandle` to 1 so a fully cleared
+    // bus behaves like a freshly-constructed one. Without this, handles
+    // grow monotonically across clear() calls — fine in production but
+    // it makes tests that recreate the bus per case non-deterministic
+    // in their handle values and accumulates unbounded growth in
+    // long-running processes that recreate the bus often.
+    it('should reset the interval handle counter on clear()', () => {
+        const h1 = bus.onInterval(60000, 'first.tick');
+        const h2 = bus.onInterval(60000, 'second.tick');
+        expect(h1).toBe(1);
+        expect(h2).toBe(2);
+
+        bus.clear();
+
+        const h3 = bus.onInterval(60000, 'after-clear.tick');
+        expect(h3).toBe(1);
+        bus.offInterval(h3);
+    });
+
     // Scenario: Multiple handlers on the same event should all be called
     it('should support multiple handlers on the same event', async () => {
         const handlerA = jest.fn();
@@ -1061,7 +1080,17 @@ describe('EventBus.onInterval', () => {
 
     // Scenario: timer is unref()d by default. We verify by spying on the
     // returned timer's unref method via a wrapper around setInterval.
+    //
+    // The suite uses fake timers (for time advancement in other tests),
+    // but Jest's fake setInterval can return a non-Node-Timeout value
+    // whose `.unref` is either missing or not a real function — patching
+    // it with `unref.bind(...)` would throw, and even when it doesn't,
+    // the code under test couldn't call a non-existent unref. Switch to
+    // real timers for this assertion (no time advancement is needed),
+    // capture the handle, and explicitly cancel it so we never leave a
+    // real 1000ms interval running in the test process.
     it('should unref() the timer by default', () => {
+        jest.useRealTimers();
         const realSetInterval = global.setInterval;
         let capturedTimer;
         global.setInterval = (...args) => {
@@ -1069,18 +1098,25 @@ describe('EventBus.onInterval', () => {
             capturedTimer.unref = jest.fn(capturedTimer.unref.bind(capturedTimer));
             return capturedTimer;
         };
+        let handle;
         try {
-            bus.onInterval(1000, 'x.event');
+            handle = bus.onInterval(1000, 'x.event');
             expect(capturedTimer.unref).toHaveBeenCalledTimes(1);
         }
         finally {
+            if (handle !== undefined) bus.offInterval(handle);
             global.setInterval = realSetInterval;
+            jest.useFakeTimers();
         }
     });
 
     // Scenario: keepAlive: true skips unref() so the timer keeps the
-    // process alive.
+    // process alive. Same real-timers caveat as the previous test;
+    // additionally, keepAlive's whole purpose is to leave the interval
+    // active, so explicit cancellation here is critical to avoid the
+    // test process being held alive by a stranded real interval.
     it('should NOT unref() the timer when keepAlive is true', () => {
+        jest.useRealTimers();
         const realSetInterval = global.setInterval;
         let capturedTimer;
         global.setInterval = (...args) => {
@@ -1088,12 +1124,15 @@ describe('EventBus.onInterval', () => {
             capturedTimer.unref = jest.fn(capturedTimer.unref.bind(capturedTimer));
             return capturedTimer;
         };
+        let handle;
         try {
-            bus.onInterval(1000, 'x.event', {}, { keepAlive: true });
+            handle = bus.onInterval(1000, 'x.event', {}, { keepAlive: true });
             expect(capturedTimer.unref).not.toHaveBeenCalled();
         }
         finally {
+            if (handle !== undefined) bus.offInterval(handle);
             global.setInterval = realSetInterval;
+            jest.useFakeTimers();
         }
     });
 
