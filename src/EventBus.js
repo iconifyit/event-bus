@@ -102,6 +102,17 @@ class EventBus {
          * @private
          */
         this._nextHandle = 1;
+
+        /**
+         * Maps command name → its single owning handler. Commands are
+         * single-owner (exactly one logical handler) and dispatched in-process
+         * via dispatch(); they do NOT go through the pub/sub adapter. Kept
+         * separate from the pub/sub maps above so an event and a command may
+         * share a name without colliding. See ADR-001.
+         * @type {Map<string, Function>}
+         * @private
+         */
+        this.commandHandlers = new Map();
     }
 
     /**
@@ -404,6 +415,104 @@ class EventBus {
         return true;
     }
 
+    // ── Commands (single-owner dispatch) ────────────────────────
+    // Events (on/emit) are facts delivered to zero-to-many listeners.
+    // Commands (handle/dispatch) are intents owned by exactly one logical
+    // handler, where dispatch awaits and propagates that handler's success or
+    // failure to the caller — the outcome a durable runner needs to retry,
+    // fail, or complete a job. See ADR-001.
+
+    /**
+     * Register the single handler that owns a command.
+     *
+     * Registering a second handler for the same command throws; the
+     * single-owner invariant is enforced here rather than silently creating
+     * competing consumers (which is a deployment concern, not a second logical
+     * handler). This is distinct from `on()`, where many listeners are valid.
+     *
+     * @param {string} command - The command name.
+     * @param {Function} handler - Handler receiving an immutable Event; its
+     *   resolved value / thrown error become `dispatch()`'s outcome.
+     * @throws {Error} If `command` is not a non-empty string, `handler` is not
+     *   a function, or a handler is already registered for this command.
+     *
+     * @example
+     * bus.handle('content.generate', async (event) => {
+     *     return contentService.generate(event.getData());
+     * });
+     */
+    handle(command, handler) {
+        if (!command || typeof command !== 'string') {
+            throw new Error('[EventBus] handle requires a non-empty string command name');
+        }
+        if (typeof handler !== 'function') {
+            throw new Error(`[EventBus] handle requires a function handler for command "${command}"`);
+        }
+        if (this.commandHandlers.has(command)) {
+            throw new Error(
+                `[EventBus] command "${command}" already has a handler; commands are single-owner`,
+            );
+        }
+        this.commandHandlers.set(command, handler);
+    }
+
+    /**
+     * Dispatch a command to its single registered handler and return that
+     * handler's outcome.
+     *
+     * Unlike `emit()` (fire-and-forget) and `emitSync()` (fans out to all
+     * subscribers and soft-fails with `false` when none are registered),
+     * `dispatch()` targets exactly one owner and propagates its result:
+     * it resolves with the handler's return value, rejects with the handler's
+     * error, and rejects when no handler is registered — an unowned command is
+     * an error, not a no-op. That outcome is what a durable runner uses to
+     * retry, fail, or complete a job. The payload is wrapped in an immutable
+     * Event, exactly as `emit()` does.
+     *
+     * `dispatch()` does NOT swallow errors or dispatch notifiers — the caller
+     * owns failure handling.
+     *
+     * @param {string} command - The command name.
+     * @param {Object} [payload={}] - The command payload.
+     * @returns {Promise<*>} Resolves with the handler's return value.
+     * @throws {Error} If `command` is not a non-empty string, or no handler is
+     *   registered for it. Propagates any error the handler throws.
+     *
+     * @example
+     * const result = await bus.dispatch('content.generate', { topic: 'icons' });
+     */
+    async dispatch(command, payload) {
+        if (!command || typeof command !== 'string') {
+            throw new Error('[EventBus] dispatch requires a non-empty string command name');
+        }
+        const handler = this.commandHandlers.get(command);
+        if (!handler) {
+            throw new Error(`[EventBus] no handler registered for command "${command}"`);
+        }
+        return await handler(Event.create(command, payload));
+    }
+
+    /**
+     * Report whether a command has a registered handler.
+     *
+     * @param {string} command - The command name.
+     * @returns {boolean} `true` if a handler is registered for the command.
+     */
+    hasHandler(command) {
+        return this.commandHandlers.has(command);
+    }
+
+    /**
+     * Remove the handler registered for a command.
+     *
+     * @param {string} command - The command name.
+     * @returns {boolean} `true` if a handler was registered and removed,
+     *   `false` if none was registered.
+     */
+    removeHandler(command) {
+        return this.commandHandlers.delete(command);
+    }
+
     /**
      * Schedule a repeating tick that emits `eventName` every `intervalMs`.
      *
@@ -555,6 +664,7 @@ class EventBus {
         this.wrappedHandlers = new WeakMap();
         this.handlersByEvent = new Map();
         this.onceHandlers    = new Map();
+        this.commandHandlers = new Map();
         for (const entry of this.intervals.values()) {
             clearInterval(entry.timer);
         }
