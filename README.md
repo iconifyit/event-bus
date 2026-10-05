@@ -118,9 +118,39 @@ bus.emit('order.confirmation', {
 });
 ```
 
+### Commands (single-owner `handle`/`dispatch`)
+
+Events (`on`/`emit`) are facts delivered to zero-to-many listeners. **Commands** are intents owned by exactly one logical handler, where `dispatch` awaits and propagates that handler's success or failure to the caller — the outcome a durable runner (e.g. a job queue) needs to retry, fail, or complete a job. Commands use an in-process registry separate from the pub/sub adapter, so an event and a command may share a name without colliding. See ADR-001.
+
+#### `bus.handle(command, handler)`
+
+Register the single handler that owns a command. Throws if `command` is not a non-empty string, `handler` is not a function, or a handler is already registered for the command (single-owner invariant).
+
+```js
+bus.handle('content.generate', async (event) => {
+    return contentService.generate(event.getData());
+});
+```
+
+#### `bus.dispatch(command, payload?)`
+
+Invoke the one registered handler with an immutable `Event` and return its outcome: **resolves** with the handler's return value, **rejects** with the handler's error, and **rejects** if no handler is registered (an unowned command is an error, not a no-op). Does not swallow errors or dispatch notifiers — the caller owns failure handling.
+
+```js
+const result = await bus.dispatch('content.generate', { topic: 'icons' });
+```
+
+#### `bus.hasHandler(command)`
+
+Returns `true` if a handler is registered for the command.
+
+#### `bus.removeHandler(command)`
+
+Remove the command's handler. Returns `true` if one existed, `false` otherwise.
+
 ### `bus.clear()`
 
-Remove all listeners and reset internal handler tracking.
+Remove all listeners and command handlers and reset internal handler tracking.
 
 ### `bus.setAdapter(adapter)`
 

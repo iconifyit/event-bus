@@ -2,7 +2,8 @@
 
 Pointer document — always links to the current version.
 
-- **Current version:** [ADR-001-command-dispatch-pattern-0.0.1.md](./ADR-001-command-dispatch-pattern-0.0.1.md) — Proposed (2026-10-04)
+- **Current version:** [ADR-001-command-dispatch-pattern-0.0.2.md](./ADR-001-command-dispatch-pattern-0.0.2.md) — Accepted (2026-10-05)
+- **Implementation plan:** [imp/ADR-001-command-dispatch-pattern-implementation-plan.md](./imp/ADR-001-command-dispatch-pattern-implementation-plan.md)
 
 ## Summary
 
@@ -12,4 +13,5 @@ Adds a **command** layer to `@vectoricons.net/event-bus` alongside the existing 
 
 | Version | Date | Status | Notes |
 |---|---|---|---|
-| 0.0.1 | 2026-10-04 | Proposed | Initial: single-owner `handle`/`dispatch` command semantics alongside pub/sub. |
+| 0.0.1 | 2026-10-04 | [DEPRECATED] | Initial: single-owner `handle`/`dispatch` command semantics alongside pub/sub; Proposed, with three open questions. Superseded by 0.0.2. |
+| 0.0.2 | 2026-10-05 | Accepted | Resolves the open questions (`removeHandler`/`hasHandler`; `Event`-wrapped dispatch; pure error propagation) and records the implementation (PR #6). |

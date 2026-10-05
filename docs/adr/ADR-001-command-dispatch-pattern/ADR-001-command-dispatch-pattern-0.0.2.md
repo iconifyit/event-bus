@@ -1,17 +1,15 @@
-# [DEPRECATED]
-
-> Superseded by [ADR-001 0.0.2](./ADR-001-command-dispatch-pattern-0.0.2.md) — same design, now **Accepted** with the three open questions resolved (`removeHandler`/`hasHandler`; `dispatch` wraps the payload in an `Event`; pure error propagation with no notifier hook) and an implementation record. Retained for history.
-
 # ADR-001: Command Dispatch Pattern for EventBus (single-owner handle/dispatch)
 
-- **Status:** Proposed (superseded by 0.0.2)
-- **Date:** 2026-10-04
+- **Status:** Accepted
+- **Date:** 2026-10-05
 - **Deciders:** Scott Lewis
-- **Package:** `@vectoricons.net/event-bus` (currently 1.4.6)
+- **Supersedes:** [ADR-001 0.0.1](./ADR-001-command-dispatch-pattern-0.0.1.md) (Proposed, with three open questions — now resolved below)
+- **Package:** `@vectoricons.net/event-bus` (1.4.6 at time of writing; releases as 1.5.0 — see Versioning & publish)
+- **Implemented by:** PR #6 (`feat: command dispatch pattern for EventBus`)
 
 ## Context
 
-`EventBus` today implements **pub/sub only**. Every registration path — `on`, `once`, `emit`, and the awaited `emitSync` — fans a single event out to **zero-to-many** independent listeners. That models a *fact*: "something happened; any interested component may react."
+`EventBus` implemented **pub/sub only**. Every registration path — `on`, `once`, `emit`, and the awaited `emitSync` — fans a single event out to **zero-to-many** independent listeners. That models a *fact*: "something happened; any interested component may react."
 
 A new class of consumer needs different semantics. Scheduled and queued work — content generation today, and other scheduled application operations in future — is a *command*: "perform this operation, and exactly one logical component owns performing it." Two properties make pub/sub the wrong primitive for it:
 
@@ -38,22 +36,30 @@ await bus.dispatch(commandName, payload);
 
 ### API
 
-- **`handle(command, handler)`** — register the single handler that owns `command`. A second `handle()` for the same command **throws** (the single-owner invariant, enforced at registration, not silently ignored).
+- **`handle(command, handler)`** — register the single handler that owns `command`. A second `handle()` for the same command **throws** (the single-owner invariant, enforced at registration, not silently ignored). Validates that `command` is a non-empty string and `handler` is a function.
 - **`dispatch(command, payload)` → `Promise`** — invoke the one registered handler with an `Event`-wrapped payload (consistent with `emit`), `await` it, and:
   - **resolve** with the handler's return value on success;
   - **reject** by propagating the handler's error on failure (so the caller can retry / fail the job);
   - **reject** if **no handler is registered** — an unowned command is an error, unlike an `emit` to no listeners.
-- **`removeHandler(command)` / `hasHandler(command)`** — deregistration and introspection, primarily for teardown and tests (final names to be settled in implementation).
+- **`hasHandler(command)`** — `true` if a handler is registered for the command.
+- **`removeHandler(command)`** — remove the command's handler; returns `true` if one existed, `false` otherwise.
 
 ### Semantics
 
 - **In-process and single-owner.** Commands do **not** go through the pub/sub adapter (whose contract is multi-listener fan-out). The command registry is a direct `Map<command, handler>` on the bus. Distributing or durably executing commands is the execution layer's job, not the bus's.
 - **Error propagation, not swallowing.** `dispatch` propagates the handler's error to the caller — unlike `emit`'s `safeRun` envelope, which catches, notifies, and re-emits `eventbus.error` for fire-and-forget listeners. The command caller owns failure handling; notifiers remain a pub/sub concern.
 - **Not "exactly-once."** The bus provides *single-owner dispatch with outcome propagation* — nothing more. It does **not** provide scheduling, persistence, retries, timeouts, concurrency, or exactly-once execution; those belong to the execution layer (pg-boss) in the consumer. The honest model is: **exactly one registered logical handler + at-least-once execution attempts (driven upstream) + idempotent handlers where side effects require it.** These three are distinct concerns and must not be conflated.
+- **`clear()`** tears down the command registry alongside the pub/sub state, so a cleared bus behaves like a freshly constructed one.
 
 ### Boundary (what this ADR does NOT do)
 
 - **No scheduler, no pg-boss, no new dependency in the package.** The package stays transport- and scheduler-agnostic. pg-boss integration — a durable job whose function calls `bus.dispatch(command, payload)` and resolves/rejects the job on the outcome — lives in the **consumer** (the api) and is governed there. This preserves the separation: EventBus owns application dispatch semantics; pg-boss owns durable execution mechanics.
+
+## Resolved decisions (from 0.0.1 open questions)
+
+1. **Deregistration/introspection names — `removeHandler(command)` and `hasHandler(command)`.** Verb-first and symmetric with the rest of the API; no better fit emerged from the library's conventions.
+2. **`dispatch` wraps the payload in an `Event`** — yes, for consistency with `emit`; handlers receive an immutable `Event` and read it via `getData()` / `getName()`, exactly as event listeners do.
+3. **Command handlers get pure error propagation, no notifier hook.** The caller (a durable runner) owns failure handling and needs the raw outcome; routing a command failure through the fire-and-forget notifier/`eventbus.error` path would hide it from the caller. Notifiers remain a pub/sub concern. Revisit only if a concrete need appears.
 
 ## Alternatives considered
 
@@ -63,22 +69,26 @@ await bus.dispatch(commandName, payload);
 
 ## Consequences
 
-**Positive:** a correct primitive for scheduled/queued work; a clean event-vs-command (CQRS-style) distinction that reads clearly at the call site; the package stays dependency-free and reusable; pg-boss stays in the consumer; and outcome propagation is exactly what a durable runner needs to drive retries. Existing pub/sub behavior is untouched, so current consumers are unaffected.
+**Positive:** a correct primitive for scheduled/queued work; a clean event-vs-command (CQRS-style) distinction that reads clearly at the call site; the package stays dependency-free and reusable; pg-boss stays in the consumer; and outcome propagation is exactly what a durable runner needs to drive retries. Existing pub/sub behavior is untouched (the diff removes no pub/sub lines), so current consumers are unaffected.
 
 **Negative / trade-offs:** net-new API surface plus its tests; a **minor version bump** (1.4.6 → 1.5.0) and an npm publish to release it; consumers must adopt `handle`/`dispatch` to use commands; and the single-owner `throw`-on-duplicate is a new behavior (but only on the new API — pub/sub is unchanged).
 
+## Implementation
+
+Implemented in **PR #6** on `claude/adr-001-command-dispatch-pattern`:
+
+- `src/EventBus.js` — a `commandHandlers` Map in the constructor; the `handle`, `dispatch`, `hasHandler`, `removeHandler` methods; `clear()` resets the command map. No pub/sub lines removed or changed.
+- `__tests__/Commands.test.js` — 16 cases: happy path, single-owner throw, input validation, every dispatch failure mode (no handler, sync throw, async reject, invalid name), introspection/removal/re-registration, pub/sub isolation, and `clear()` lifecycle.
+- Full suite: 148/148 green; the new file runs under the standard `npm test` (jest) in CI.
+
+See [`imp/ADR-001-command-dispatch-pattern-implementation-plan.md`](./imp/ADR-001-command-dispatch-pattern-implementation-plan.md).
+
 ## Code being removed
 
-**None.** This is purely additive to the package. (This branch also deletes the repo-local `.agents/` directory, but that is unrelated housekeeping — the agent definitions are now maintained globally — not part of this decision.)
+**None.** Purely additive to the package. (The branch also deletes the repo-local `.agents/` directory — unrelated housekeeping; the agent definitions are now maintained globally — in its own commit.)
 
 ## Versioning & publish
 
-When implemented, release as a **minor** bump (1.4.6 → 1.5.0), since the change is additive and backward-compatible. Publishing to npm is the maintainer's explicit action and is not performed as part of this ADR.
+The change is additive and backward-compatible, so it releases as a **minor** bump, **1.4.6 → 1.5.0**. Per the repo-versioning rule, the bump is **not** applied on this feature PR (feature → `develop`), which is a non-release PR; it is applied on the **release PR** (`develop` → `main`) together with the npm publish. **Publishing is the maintainer's explicit action** and is not performed as part of this work. `package.json` therefore remains `1.4.6` on this branch by design.
 
-## Open questions for review
-
-1. Final names for deregistration/introspection (`removeHandler`/`hasHandler` vs. alternatives consistent with the library).
-2. Confirm `dispatch` wraps the payload in an `Event` for consistency with `emit` (lean: yes).
-3. Confirm command handlers get **pure error propagation** with no notifier hook (lean: yes — the caller owns failure); revisit only if a concrete need appears.
-
-Per `adr-required` / `how-to-use-adrs`, the implementation plan is authored only after this ADR is reviewed and approved.
+Per `adr-required` / `how-to-use-adrs`, this version is Accepted and its implementation plan lives in `imp/`.
