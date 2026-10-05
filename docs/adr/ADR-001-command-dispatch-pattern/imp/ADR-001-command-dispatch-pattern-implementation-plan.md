@@ -21,7 +21,7 @@
 
 ## Verification
 
-- `npm test` (jest): full suite **148/148 green**, including the 16 new command cases; the new file is picked up by the standard CI test run.
+- `npm test` (jest): full suite **149/149 green**, including the 14 new command cases; the new file is picked up by the standard CI test run.
 
 ## Versioning & publish (release step — maintainer)
 

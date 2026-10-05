@@ -106,6 +106,21 @@ describe('EventBus commands (handle/dispatch)', () => {
         await expect(bus.dispatch('content.generate', {})).rejects.toThrow('async boom');
     });
 
+    // The complementary half of the propagation contract (ADR-001): dispatch
+    // propagates the error to the CALLER only — it must NOT route a command
+    // failure through the pub/sub fire-and-forget path (no `eventbus.error`
+    // emission), which would hide the failure from the caller that owns it.
+    it('does not emit eventbus.error when a command handler throws', async () => {
+        const errorListener = jest.fn();
+        bus.on('eventbus.error', errorListener);
+        bus.handle('content.generate', () => { throw new Error('boom'); });
+
+        await expect(bus.dispatch('content.generate', {})).rejects.toThrow('boom');
+        await tick(); // allow any (incorrect) async eventbus.error emission to fire
+
+        expect(errorListener).not.toHaveBeenCalled();
+    });
+
     // dispatch validates its command name too.
     it('rejects on an invalid command name at dispatch', async () => {
         await expect(bus.dispatch('')).rejects.toThrow(/non-empty string/);

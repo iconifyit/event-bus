@@ -78,8 +78,8 @@ await bus.dispatch(commandName, payload);
 Implemented in **PR #6** on `claude/adr-001-command-dispatch-pattern`:
 
 - `src/EventBus.js` — a `commandHandlers` Map in the constructor; the `handle`, `dispatch`, `hasHandler`, `removeHandler` methods; `clear()` resets the command map. No pub/sub lines removed or changed.
-- `__tests__/Commands.test.js` — 16 cases: happy path, single-owner throw, input validation, every dispatch failure mode (no handler, sync throw, async reject, invalid name), introspection/removal/re-registration, pub/sub isolation, and `clear()` lifecycle.
-- Full suite: 148/148 green; the new file runs under the standard `npm test` (jest) in CI.
+- `__tests__/Commands.test.js` — 14 cases: happy path, single-owner throw, input validation, every dispatch failure mode (no handler, sync throw, async reject, invalid name), the no-`eventbus.error` propagation half, introspection/removal/re-registration, pub/sub isolation, and `clear()` lifecycle.
+- Full suite: 149/149 green; the new file runs under the standard `npm test` (jest) in CI.
 
 See [`imp/ADR-001-command-dispatch-pattern-implementation-plan.md`](./imp/ADR-001-command-dispatch-pattern-implementation-plan.md).
 
